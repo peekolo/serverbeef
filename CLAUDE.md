@@ -11,8 +11,10 @@ root on the server. This file covers running it for someone and changing it.
 2. **Check for a key before anything else.** Key-only login is turned on only if the admin ends up with at least one
    key (from `--ssh-key` or root's `authorized_keys`). Without one, password login stays on and the run prints a
    warning. Don't treat that as success.
-3. **Keep the first session open.** SSH moves to port 2222 during the run. Before the session that ran the script is
-   closed, someone must log in from a second connection: `ssh -p 2222 <admin>@<ip>`, then `sudo -v`. Never close the
+3. **Keep the first session open.** SSH moves to a new port during the run: the `--ssh-port` given, or a random one
+   that the summary prints. If the provider has a firewall, that port must be allowed there first. Before the session
+   that ran the script is closed, someone must log in from a second connection: `ssh -p <port> <admin>@<ip>`, then
+   `sudo -v`. Never close the
    root session or reboot before that works.
 4. **Don't pick `deploy` as the admin out of habit.** It is the default name, but setups that keep a separate
    unprivileged `deploy` user for app deployments need the admin to have a different name. Ask the owner.
@@ -26,7 +28,8 @@ root on the server. This file covers running it for someone and changing it.
 Unattended run:
 
 ```bash
-ssh -t root@<ip> 'bash serverbeef.sh --yes --user <admin> --ssh-key "<public key>" [--docker] [--udp-ports none]'
+ssh -t root@<ip> 'bash serverbeef.sh --yes --user <admin> --ssh-port <port> --ssh-key "<public key>" \
+                   [--docker] [--udp-ports none]'
 ```
 
 ## Changing the script

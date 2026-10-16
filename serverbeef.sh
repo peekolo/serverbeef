@@ -85,7 +85,7 @@ ADMIN_SUDO_NOPASSWD="${ADMIN_SUDO_NOPASSWD:-auto}" # yes | no | auto (yes if the
 GENERATE_PASSWORD="${GENERATE_PASSWORD:-no}"    # set by the wizard when you accept [auto-generate]
 COPY_ROOT_KEYS="${COPY_ROOT_KEYS:-yes}"         # copy root's authorized_keys to the admin user
 
-SSH_PORT="${SSH_PORT:-2222}"                    # non-22 port cuts brute-force log noise
+SSH_PORT="${SSH_PORT:-}"                        # empty or "random": a random free port in 1025-9999 (per server)
 SSH_ALLOW_TCP_FORWARDING="${SSH_ALLOW_TCP_FORWARDING:-local}" # no | local | yes  (local keeps `ssh -L` DB tunnels working)
 
 FIREWALL_TCP_PORTS="${FIREWALL_TCP_PORTS-80 443}"   # extra public TCP ports (SSH is added automatically); empty = none
@@ -120,7 +120,7 @@ Options:
       --no-copy-root-keys    Don't copy root's authorized_keys to the admin user
       --sudo-nopasswd        Passwordless sudo (default if a key is installed)
       --sudo-password        Require a password for sudo (generated if none set)
-  -p, --ssh-port PORT        SSH port                             [2222]
+  -p, --ssh-port PORT        SSH port, or "random"                [random]
       --forwarding MODE      SSH TCP forwarding: no|local|yes     [local]
       --tcp-ports "P ..."    Public TCP ports (besides SSH)       ["80 443"]
       --udp-ports "P ..."    Public UDP ports, "none" to disable  ["443"]
@@ -178,6 +178,23 @@ while [[ $# -gt 0 ]]; do
     *) echo "Unknown option: $1 (see --help)" >&2; exit 1 ;;
   esac
 done
+
+# ----------------------------- SSH port --------------------------------------
+# No fixed default: a port every server shares is a port every scanner tries first. Below 10000 because
+# net.ipv4.ip_local_port_range (step 8) hands out 10000-65535 to outgoing connections.
+SSH_PORT_RANDOM=no
+random_port() {
+  local p common=" 1080 1433 1521 2049 2375 2376 2377 2222 3000 3001 3306 3389 4000 4200 4443 5000 5173 5432 5672 5900 5984 6379 6443 7000 7001 8000 8008 8080 8081 8088 8443 8888 9000 9042 9090 9092 9100 9200 9300 9418 9443 "
+  while true; do
+    p=$(( 1025 + (RANDOM * 32768 + RANDOM) % 8975 ))
+    [[ "$common" == *" $p "* ]] && continue
+    ss -tlnH 2>/dev/null | awk '{print $4}' | grep -qE "[:.]$p$" && continue
+    echo "$p"; return
+  done
+}
+if [[ -z "$SSH_PORT" || "${SSH_PORT,,}" == "random" ]]; then
+  SSH_PORT="$(random_port)"; SSH_PORT_RANDOM=yes
+fi
 
 # ----------------------------- Helpers ---------------------------------------
 if [[ -t 1 ]]; then
@@ -619,7 +636,7 @@ EOF
   fi
 
   section "SSH"
-  ask SSH_PORT "SSH port" valid_port "A port other than 22 cuts bot noise. Also open it in your provider's firewall, if it has one."
+  ask SSH_PORT "SSH port" valid_port "$([[ "$SSH_PORT_RANDOM" == yes ]] && echo "Picked at random for this server; keep it or type your own. " || true)Open it in your provider's firewall, if it has one, before you log in on it."
   ask SSH_ALLOW_TCP_FORWARDING "TCP forwarding (no/local/yes)" valid_forwarding "'local' lets you tunnel to e.g. a database with ssh -L."
 
   section "Firewall"
@@ -697,7 +714,7 @@ ${C_BLUE}serverbeef — about to configure this server:${C_RESET}
   Admin user ............ $ADMIN_USER
   SSH keys .............. $key_summary
   Passwordless sudo ..... $ADMIN_SUDO_NOPASSWD$([[ "$GENERATE_PASSWORD" == yes ]] && echo " (password: auto-generated, shown at the end)")
-  SSH port .............. $SSH_PORT (forwarding: $SSH_ALLOW_TCP_FORWARDING)
+  SSH port .............. $SSH_PORT (forwarding: $SSH_ALLOW_TCP_FORWARDING)$([[ "$SSH_PORT_RANDOM" == yes ]] && echo " ${C_YELLOW}picked at random: write it down and open it in your provider's firewall${C_RESET}")
   Public TCP ports ...... ${FIREWALL_TCP_PORTS:-none}
   Public UDP ports ...... ${FIREWALL_UDP_PORTS:-none}
   Hostname .............. ${SET_HOSTNAME:-(unchanged)}
@@ -1209,6 +1226,9 @@ echo "${C_GREEN}=============================================================${C
 echo "${C_GREEN} serverbeef complete${C_RESET}  (log: $LOG_FILE)"
 echo "${C_GREEN}=============================================================${C_RESET}"
 cat <<EOF
+
+ SSH now listens on port ${C_BOLD}$SSH_PORT${C_RESET}. Write it down, allow it in your provider's firewall if it has one,
+ and add it to your ~/.ssh/config.
 
  ${C_YELLOW}BEFORE closing this session${C_RESET}, open a NEW terminal and test:
 

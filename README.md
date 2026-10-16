@@ -17,11 +17,12 @@ scp serverbeef.sh root@<ip>:
 ssh -t root@<ip> 'bash serverbeef.sh'
 ```
 
-The wizard asks for each setting and shows its default. When it finishes, **keep that session open** and test the new
+The wizard asks for each setting and shows its default. The SSH port is picked at random for each server, so it is
+not one that scanners try first; the summary prints it. When it finishes, **keep that session open** and test the new
 login from a second terminal:
 
 ```bash
-ssh -p 2222 <admin>@<ip>
+ssh -p <port> <admin>@<ip>
 sudo -v
 sudo serverbeef --verify
 ```
@@ -32,7 +33,7 @@ open.
 Unattended, with flags instead of the wizard:
 
 ```bash
-bash serverbeef.sh --yes --user alice --docker --udp-ports none
+bash serverbeef.sh --yes --user alice --ssh-port 4821 --docker --udp-ports none
 ```
 
 ## What it does
@@ -42,7 +43,7 @@ bash serverbeef.sh --yes --user alice --docker --udp-ports none
 | 1. Packages | Full upgrade, then common tools (curl, jq, git, htop, tmux, vim, dnsutils...), ufw, fail2ban, unattended-upgrades, chrony, AppArmor, Lynis. `needrestart` restarts services without asking |
 | 2. Hostname, time | Optional hostname and timezone; time sync with chrony |
 | 3. Admin user | Creates the sudo user, installs your public key(s) and copies root's authorized keys. Passwordless sudo when a key is installed, otherwise a password (generated if you give none, shown once and never written to the log) |
-| 4. SSH | Custom port (2222), key-only login, no root login, only the `sudo` and `ssh-users` groups may log in, agent/X11 forwarding off, `ssh -L` tunnels allowed by default. The config is tested with `sshd -t` before it is used |
+| 4. SSH | A port of its own for each server (random unless you choose one), key-only login, no root login, only the `sudo` and `ssh-users` groups may log in, agent/X11 forwarding off, `ssh -L` tunnels allowed by default. The config is tested with `sshd -t` before it is used |
 | 5. Firewall | UFW denies incoming by default; SSH (rate limited), 80/tcp, 443/tcp and 443/udp are open. `--tcp-ports` and `--udp-ports` change the list |
 | 6. Fail2ban | SSH jail in aggressive mode, bans that get longer for repeat offenders, and a recidive jail (one week) |
 | 7. Updates | Unattended security upgrades, with an automatic reboot at 04:00 when one is needed (can be turned off) |
@@ -64,7 +65,7 @@ saved in `/etc/serverbeef/state.conf` (never passwords or keys), and the script 
 | `-k, --ssh-key "KEY"` | | Public key for the admin; repeat for several |
 | `--no-copy-root-keys` | | Don't copy root's authorized keys to the admin |
 | `--sudo-nopasswd` / `--sudo-password` | auto | Passwordless sudo is the default when a key is installed |
-| `-p, --ssh-port PORT` | `2222` | SSH port |
+| `-p, --ssh-port PORT` | `random` | SSH port; a random free port in 1025-9999 unless you give one |
 | `--forwarding no\|local\|yes` | `local` | SSH TCP forwarding |
 | `--tcp-ports "P ..."` | `"80 443"` | Public TCP ports besides SSH |
 | `--udp-ports "P ..."` | `"443"` | Public UDP ports (HTTP/3); `none` for none |
@@ -93,6 +94,8 @@ old port 22), then runs a quick Lynis audit and prints the score and warnings.
 - Docker-published ports bypass UFW. Docker writes its own iptables rules, so `-p 5432:5432` is open to the
   internet whatever UFW says. Bind internal services to localhost (`-p 127.0.0.1:5432:5432`), put a firewall at your
   provider in front of the server, or both. The script warns about this and the verify mode lists exposed ports.
+- If your provider has a firewall in front of the server, choose the SSH port before you run the script
+  (`--ssh-port 4821`, or let the wizard pick one and note it) and allow it there, or you can't log in on it.
 - Port 22 stays open in UFW until you remove it. If your provider added a rule for port 22, the script prints the
   exact delete command, and verify mode offers to remove it once you are logged in on the new port.
 - Without an SSH key, password login stays on. So that you can't be locked out, key-only login is turned on only
