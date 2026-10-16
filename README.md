@@ -1,40 +1,112 @@
 # serverbeef
 
-One bash script that turns a fresh Ubuntu 26.04 VPS into a hardened server for web apps. Run it as root on a new
-box, answer a few questions (or pass flags), and it sets up a sudo admin with key-only SSH, a firewall, fail2ban,
-automatic security updates, kernel and network tuning, swap, and optionally Docker.
+You built an app with AI and rented a server to put it online. A new server is easy to break into: anyone on the
+internet can try to guess the root password, nothing filters incoming traffic, and security updates wait until
+someone installs them. serverbeef fixes that in one run. You copy one command, answer a few questions, and it locks
+the server down for you.
 
-Every step can be re-run safely. A second run offers to check the server instead, and the check can also clean up
-old firewall rules and run a Lynis audit.
+It works on a fresh **Ubuntu 26.04** server from any provider (DigitalOcean, Hetzner, Vultr, Linode and so on). It
+takes about ten minutes.
 
-## Quick start
+## How to use it
 
-On a new Ubuntu 26.04 x64 server, as root, with your SSH key already on root (most providers do this when you create
-the server):
+You need the server's IP address (it's on your provider's dashboard) and a terminal on your own computer: the
+Terminal app on a Mac, or PowerShell on Windows.
+
+### 1. Make a login key on your computer
+
+A key is a pair of files that lets you log in without a password. Nobody can guess it. Skip this step if you already
+have one.
+
+In the terminal on your computer, run:
+
+```bash
+ssh-keygen -t ed25519
+```
+
+Press Enter at every question. Then print your public key:
+
+```bash
+cat ~/.ssh/id_ed25519.pub
+```
+
+You'll see one long line that starts with `ssh-ed25519`. Copy the whole line; you'll paste it in step 3. (If
+`ssh-keygen` says the file already exists, you have a key already. Type `n`, then run the `cat` command.)
+
+### 2. Log in to your server
+
+```bash
+ssh root@YOUR_SERVER_IP
+```
+
+Put your server's IP address in place of `YOUR_SERVER_IP`. The first time, it asks whether you want to continue
+connecting: type `yes`. If it asks for a password, use the root password from your provider.
+
+### 3. Run serverbeef
+
+Copy this line into the server window and press Enter:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/peekolo/serverbeef/HEAD/serverbeef.sh -o serverbeef.sh && bash serverbeef.sh
+```
+
+It asks a few questions. Pressing Enter accepts the suggested answer shown in `[brackets]`, and that is fine for most
+of them. Answer these ones yourself:
+
+- For the admin username, type a short name of your own, such as your first name in lowercase. You'll log in with
+  this account from now on, because logging in as root gets turned off.
+- When it asks for a public key, paste the line you copied in step 1. If it found keys on root and asks whether to
+  copy them, answer yes to that too.
+- If your app runs in Docker, answer yes to the Docker question.
+
+Before it changes anything, it shows a summary and asks you to confirm. Find the SSH port there (a number
+like `4821`) and write it down: from now on you log in on that port. At the end it prints the exact login command.
+If it shows a password, save it in a password manager.
+
+### 4. Test the new login before you close anything
+
+**Leave the server window open.** Open a second terminal window on your computer and run the command from the end of
+the setup. It looks like this:
+
+```bash
+ssh -p 4821 yourname@YOUR_SERVER_IP
+sudo -v
+```
+
+If you get in and `sudo -v` finishes without an error, you're done. Close both windows whenever you like.
+
+If it doesn't connect, keep the first window open, since it is still logged in and can fix things. The usual cause
+is a firewall on your provider's dashboard (often called "Firewall" or "Security group") that blocks the new port.
+Add a rule there that allows TCP on your SSH port, then try again.
+
+From now on, log in with `ssh -p <port> <yourname>@<ip>`. To check the server later, run `sudo serverbeef --verify`
+on it.
+
+### Using an AI coding agent?
+
+You can ask Claude Code or a similar agent to run serverbeef on your server for you. [CLAUDE.md](CLAUDE.md) tells
+the agent how to do it without locking you out.
+
+## Other ways to run it
+
+Everything above can be re-run safely. A second run offers to check the server instead, and the check can also clean
+up old firewall rules and run a Lynis audit.
+
+If you'd rather not download from the server, copy the script over yourself:
 
 ```bash
 scp serverbeef.sh root@<ip>:
 ssh -t root@<ip> 'bash serverbeef.sh'
 ```
 
-The wizard asks for each setting and shows its default. The SSH port is picked at random for each server, so it is
-not one that scanners try first; the summary prints it. When it finishes, **keep that session open** and test the new
-login from a second terminal:
+Unattended, with flags instead of the questions:
 
 ```bash
-ssh -p <port> <admin>@<ip>
-sudo -v
-sudo serverbeef --verify
+bash serverbeef.sh --yes --user alice --ssh-port 4821 --ssh-key "ssh-ed25519 AAAA..." --docker --udp-ports none
 ```
 
-Only close the root session once that works. If something is wrong, you can still fix it from the session that is
-open.
-
-Unattended, with flags instead of the wizard:
-
-```bash
-bash serverbeef.sh --yes --user alice --ssh-port 4821 --docker --udp-ports none
-```
+It also works with `curl ... | sudo bash`, because the questions are read from `/dev/tty`. Read the script before you
+pipe anything from the internet into a root shell.
 
 ## What it does
 
@@ -104,8 +176,6 @@ old port 22), then runs a quick Lynis audit and prints the score and warnings.
   want a second factor.
 - At the end the script asks `ifconfig.me` for the server's public IP, only to print the right `ssh` command.
 - It targets Ubuntu 26.04 on x86_64. It warns on other versions and architectures and refuses non-Ubuntu systems.
-- It also works with `curl ... | sudo bash`, because the wizard reads from `/dev/tty`. Read the script before you
-  pipe anything from the internet into a root shell.
 
 ## For AI agents
 
