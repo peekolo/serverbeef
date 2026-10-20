@@ -82,6 +82,14 @@ Add a rule there that allows TCP on your SSH port, then try again.
 From now on, log in with `ssh -p <port> <yourname>@<ip>`. To check the server later, run `sudo serverbeef --verify`
 on it.
 
+### 5. Put your app online
+
+serverbeef only secures the server. To get your app running on it at your own domain, with HTTPS and Cloudflare
+protection, use its companion project
+[caddy-behind-cloudflare](https://github.com/peekolo/caddy-behind-cloudflare). It is a step-by-step playbook that
+your AI assistant follows to deploy Docker apps onto the server, and you can run several apps on the same server.
+Its README starts by cloning serverbeef, so you can use the two together from the beginning.
+
 ### Using an AI coding agent?
 
 You can ask Claude Code or a similar agent to run serverbeef on your server for you. [CLAUDE.md](CLAUDE.md) tells
