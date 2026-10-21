@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# shellcheck disable=SC2015  # "A && B || true" is deliberate under set -e
 # =============================================================================
 #  serverbeef.sh — Harden and tune a fresh Ubuntu 26.04 LTS (x64) VPS for webapps
 # =============================================================================
@@ -33,7 +34,11 @@
 #  test logging in from a NEW terminal before disconnecting.
 # =============================================================================
 
+# Do not let bash -x / -v copy credentials into a terminal or the setup log.
+set +xv
 set -Eeuo pipefail
+# Config files keep the normal 644 so that tools run by the admin (apt, sysctl, systemd) can read them.
+# Secrets get explicit modes: the log and state file 600, the password file 600, the swap file 600.
 
 # ----------------------------- Previous run ----------------------------------
 # After a successful run the settings are saved here (never passwords or keys).
@@ -148,6 +153,31 @@ EOF
 }
 
 # ----------------------------- CLI args --------------------------------------
+# Config files are data, never shell programs. Quotes only delimit a literal
+# value; expansion, escapes, inline comments and shell statements are unsupported.
+load_config() {
+  local file="$1" line name value line_no=0
+  local allowed=" $STATE_KEYS ADMIN_SSH_KEY ADMIN_PASSWORD GENERATE_PASSWORD COPY_ROOT_KEYS SET_HOSTNAME TIMEZONE ASSUME_YES "
+  [[ -f "$file" && -r "$file" ]] || { echo "Cannot read config file" >&2; return 1; }
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line_no=$((line_no + 1))
+    [[ "$line" =~ ^[[:space:]]*(#.*)?$ ]] && continue
+    if [[ ! "$line" =~ ^([A-Z_]+)=(.*)$ ]]; then
+      echo "Invalid config assignment at line $line_no" >&2; return 1
+    fi
+    name="${BASH_REMATCH[1]}"; value="${BASH_REMATCH[2]}"
+    if [[ "$allowed" != *" $name "* ]]; then
+      echo "Unsupported config setting at line $line_no" >&2; return 1
+    fi
+    case "$value" in
+      \"|\') echo "Unbalanced quote at line $line_no" >&2; return 1 ;;
+      \"*\") value="${value:1:${#value}-2}" ;;
+      \'*\') value="${value:1:${#value}-2}" ;;
+      *[[:space:]\"\']*) echo "Quote config values containing spaces (line $line_no)" >&2; return 1 ;;
+    esac
+    printf -v "$name" '%s' "$value"
+  done < "$file"
+}
 need_arg() { [[ $# -ge 2 && -n "$2" ]] || { echo "Option $1 needs a value" >&2; exit 1; }; }
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -169,8 +199,7 @@ while [[ $# -gt 0 ]]; do
     --docker)             INSTALL_DOCKER=yes; shift ;;
     --no-docker)          INSTALL_DOCKER=no; shift ;;
     -c|--config)          need_arg "$@"
-                          # shellcheck disable=SC1090
-                          source "$2"; shift 2 ;;
+                          load_config "$2" || exit 1; shift 2 ;;
     --verify)             MODE=verify; shift ;;
     --setup)              MODE=setup; shift ;;
     -y|--yes|--non-interactive) ASSUME_YES=yes; shift ;;
@@ -179,6 +208,9 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+# Keep a password supplied through the environment out of child processes.
+export -n ADMIN_PASSWORD
+
 # ----------------------------- SSH port --------------------------------------
 # No fixed default: a port every server shares is a port every scanner tries first. Below 10000 because
 # net.ipv4.ip_local_port_range (step 8) hands out 10000-65535 to outgoing connections.
@@ -186,7 +218,7 @@ SSH_PORT_RANDOM=no
 random_port() {
   local p common=" 1080 1433 1521 2049 2375 2376 2377 2222 3000 3001 3306 3389 4000 4200 4443 5000 5173 5432 5672 5900 5984 6379 6443 7000 7001 8000 8008 8080 8081 8088 8443 8888 9000 9042 9090 9092 9100 9200 9300 9418 9443 "
   while true; do
-    p=$(( 1025 + (RANDOM * 32768 + RANDOM) % 8975 ))
+    p=$(( 1025 + $(od -An -N2 -tu2 /dev/urandom | tr -d ' ') % 8975 ))
     [[ "$common" == *" $p "* ]] && continue
     ss -tlnH 2>/dev/null | awk '{print $4}' | grep -qE "[:.]$p$" && continue
     echo "$p"; return
@@ -209,7 +241,25 @@ die()  { echo "${C_RED}  ✘ $*${C_RESET}" >&2; exit 1; }
 WARNINGS=()
 GENERATED_PASSWORD=""
 
-trap 'die "Failed at line $LINENO: $BASH_COMMAND (see $LOG_FILE)"' ERR
+# shellcheck disable=SC2120  # the directory argument is for the tests
+deliver_generated_password() {
+  local directory="${1:-/root}" file temp
+  # Deliver before changing the account, so a later failure cannot lose it.
+  # /dev/tty bypasses the tee logger; unattended credentials use an atomic file.
+  if { printf '\nGenerated password for %s — save it now in your password manager:\n%s\n\n' \
+    "$ADMIN_USER" "$GENERATED_PASSWORD" > /dev/tty; } 2>/dev/null; then
+    return
+  fi
+  file="$directory/${MARK}-${ADMIN_USER}-password.txt"
+  temp="$(mktemp "$directory/${MARK}-password.XXXXXX")"
+  printf '%s\n' "$GENERATED_PASSWORD" > "$temp"
+  chmod 600 "$temp"
+  mv -fT "$temp" "$file"
+  echo "Generated credential saved to $file (root-only); save it securely and delete that file."
+}
+
+# Commands and their arguments can contain passwords. Log only the location.
+trap 'die "Failed at line $LINENO (see $LOG_FILE)"' ERR
 
 export DEBIAN_FRONTEND=noninteractive
 export NEEDRESTART_MODE=a
@@ -221,8 +271,17 @@ yesno() { case "${1,,}" in y|yes|true|1) echo yes ;; n|no|false|0) echo no ;; *)
 
 # ----------------------------- Validators ------------------------------------
 valid_user()       { [[ "$1" =~ ^[a-z_][a-z0-9_-]{0,31}$ && "$1" != "root" ]]; }
-valid_port()       { [[ "$1" =~ ^[0-9]+$ ]] && (( $1 >= 1 && $1 <= 65535 )); }
-valid_ports()      { local p; for p in $1; do valid_port "$p" || [[ "$p" =~ ^[0-9]+:[0-9]+$ ]] || return 1; done; }
+valid_port()       { [[ "$1" =~ ^[1-9][0-9]{0,4}$ ]] && (( 10#$1 <= 65535 )); }
+valid_ports() {
+  local p start end
+  [[ "$1" =~ ^[0-9:[:space:]]*$ ]] || return 1
+  for p in $1; do
+    valid_port "$p" && continue
+    [[ "$p" =~ ^([0-9]+):([0-9]+)$ ]] || return 1
+    start="${BASH_REMATCH[1]}"; end="${BASH_REMATCH[2]}"
+    valid_port "$start" && valid_port "$end" && (( 10#$start < 10#$end )) || return 1
+  done
+}
 valid_hostname()   { [[ -z "$1" || "$1" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]{0,251}[A-Za-z0-9])?$ ]]; }
 valid_timezone()   { [[ -z "$1" || ( "$1" != *..* && -f "/usr/share/zoneinfo/$1" ) ]]; }
 valid_swap()       { [[ "$1" =~ ^(auto|none|[0-9]+[MG])$ ]]; }
@@ -230,9 +289,13 @@ valid_time()       { [[ "$1" =~ ^([01][0-9]|2[0-3]):[0-5][0-9]$ ]]; }
 valid_yesno()      { [[ "$1" == "yes" || "$1" == "no" ]]; }
 valid_forwarding() { [[ "$1" =~ ^(no|local|yes)$ ]]; }
 valid_sshkey() {
+  [[ "$1" != *$'\n'* && "$1" != *$'\r'* ]] || return 1
   [[ "$1" =~ ^(ssh-(ed25519|rsa)|ecdsa-sha2-nistp[0-9]+|sk-[a-z0-9@.-]+)\ [A-Za-z0-9+/=]+ ]] || return 1
-  if command -v ssh-keygen >/dev/null; then ssh-keygen -l -f - <<< "$1" >/dev/null 2>&1; fi
+  command -v ssh-keygen >/dev/null || return 1
+  ssh-keygen -l -f - <<< "$1" >/dev/null 2>&1
 }
+
+valid_password() { [[ "$1" != *$'\n'* && "$1" != *$'\r'* ]]; }
 
 # ----------------------------- Wizard ----------------------------------------
 # Prompts read from /dev/tty so `curl ... | sudo bash` still works.
@@ -277,15 +340,59 @@ if [[ "${VERSION_ID:-}" != "26.04" ]]; then
 fi
 [[ "$(uname -m)" == "x86_64" ]] || echo "${C_YELLOW}Warning: written for x86_64, detected $(uname -m).${C_RESET}"
 
-# Pull the bare "type base64 comment" out of an authorized_keys line (drops options= prefixes)
-extract_key() { grep -oE '(ssh-(ed25519|rsa)|ecdsa-sha2-nistp[0-9]+|sk-[a-z0-9@.-]+) [A-Za-z0-9+/=]+.*' <<< "$1" || true; }
+# Never strip authorized_keys options: a forced-command backup key must not
+# become an unrestricted sudo login. Only bare, validated keys qualify here.
+extract_key() { if valid_sshkey "$1"; then printf '%s\n' "$1"; fi; }
 # "ED25519  SHA256:...  comment"
 key_fingerprint() {
   local fp
   fp="$(ssh-keygen -l -f - <<< "$1" 2>/dev/null)" || { echo "${1:0:40}..."; return; }
   awk '{t=$NF; gsub(/[()]/,"",t); c=""; for(i=3;i<NF;i++) c=c (c?" ":"") $i; printf "%-8s %s  %s\n", t, $2, c}' <<< "$fp"
 }
-count_keys() { grep -cE '^(ssh-|ecdsa-|sk-)' "$1" 2>/dev/null || true; }
+count_keys() {
+  local line count=0
+  if [[ -r "$1" ]]; then
+    while IFS= read -r line || [[ -n "$line" ]]; do
+      if valid_sshkey "$line"; then count=$((count + 1)); fi
+    done < "$1"
+  fi
+  echo "$count"
+}
+
+# Evaluate global policy and representative Match contexts. This is not a proof
+# about every possible Match Address/Host rule; verify reports that limitation.
+ssh_policy_ok() {
+  local cfg user addr context
+  local -a contexts=("")
+  for user in "$ADMIN_USER" root; do
+    for addr in 198.51.100.1 2001:db8::1; do
+      contexts+=("user=$user,host=serverbeef-check.invalid,addr=$addr,laddr=127.0.0.1,lport=$SSH_PORT")
+    done
+    if [[ -n "${SSH_CONNECTION:-}" ]]; then
+      local client_ip server_ip
+      read -r client_ip _ server_ip _ <<< "$SSH_CONNECTION"
+      contexts+=("user=$user,host=$client_ip,addr=$client_ip,laddr=$server_ip,lport=$SSH_PORT")
+    fi
+  done
+  for context in "${contexts[@]}"; do
+    if [[ -n "$context" ]]; then
+      cfg="$(sshd -T -C "$context")" || return 1
+    else
+      cfg="$(sshd -T)" || return 1
+      [[ "$(awk '$1=="port"{print $2}' <<< "$cfg")" == "$SSH_PORT" ]] || return 1
+    fi
+    grep -qx 'pubkeyauthentication yes' <<< "$cfg" || return 1
+    grep -qx 'kbdinteractiveauthentication no' <<< "$cfg" || return 1
+    if [[ "$HAVE_KEYS" == yes ]]; then
+      grep -qx 'passwordauthentication no' <<< "$cfg" || return 1
+      grep -qx 'permitrootlogin no' <<< "$cfg" || return 1
+      grep -qx 'authenticationmethods publickey' <<< "$cfg" || return 1
+    else
+      grep -qx 'passwordauthentication yes' <<< "$cfg" || return 1
+      grep -qxE 'permitrootlogin (prohibit-password|without-password|no)' <<< "$cfg" || return 1
+    fi
+  done
+}
 
 # ============================================================================
 #  Verify mode — checks a server this script already set up
@@ -338,6 +445,17 @@ run_lynis() {
   vhint "$suggestions suggestion(s). Full output: $out  ·  Report: $report"
 }
 
+automatic_updates_enabled() {
+  local apt_settings
+  systemctl is-enabled --quiet unattended-upgrades 2>/dev/null || return 1
+  apt_settings="$(apt-config dump)" || return 1
+  # Read the complete output before matching: grep -q in a pipe can make
+  # apt-config exit on SIGPIPE under pipefail and report a false failure.
+  grep -qx 'APT::Periodic::Update-Package-Lists "1";' <<< "$apt_settings" || return 1
+  grep -qx 'APT::Periodic::Unattended-Upgrade "1";' <<< "$apt_settings" || return 1
+  ! grep -qx 'APT::Periodic::Enable "0";' <<< "$apt_settings"
+}
+
 run_verify() {
   local user_home keys sshd_cfg p rule token port
   echo
@@ -356,17 +474,35 @@ run_verify() {
     else vfail "Password login is ON even though $ADMIN_USER has a key"; vhint "Choose 'Run setup again' to fix"
     fi
     if grep -qx 'permitrootlogin no' <<< "$sshd_cfg"; then vpass "Root login is off"
-    else vwarn "Root login is allowed ($(awk '$1=="permitrootlogin"{print $2}' <<< "$sshd_cfg"))"
+    else vfail "Root login is allowed ($(awk '$1=="permitrootlogin"{print $2}' <<< "$sshd_cfg"))"; vhint "Review SSH configuration before re-running setup"
     fi
   else
-    vwarn "$ADMIN_USER has no SSH key, so password login is still on"
-    vhint "Choose 'Run setup again' and paste a key to switch to key-only login"
+    vfail "$ADMIN_USER has no validated, unrestricted SSH key"
+    vhint "Install and test a personal admin key before enabling key-only login"
+  fi
+  HAVE_KEYS=no; (( keys > 0 )) && HAVE_KEYS=yes
+  if sshd -t && ssh_policy_ok; then
+    vpass "Effective SSH policy matches in global and sampled connection contexts"
+  else
+    vfail "Effective SSH policy differs from the intended settings"
+    vhint "Inspect sudo sshd -T and sudo sshd -T -C user=$ADMIN_USER,host=CLIENT,addr=CLIENT_IP"
+  fi
+  if grep -Eq '^[[:space:]]*Match[[:space:]]' /etc/ssh/sshd_config /etc/ssh/sshd_config.d/*.conf 2>/dev/null; then
+    vwarn "SSH Match rules exist; sampled checks cannot cover every source address or hostname"
+    vhint "Review all included SSH files and test each intended login path"
   fi
 
   section "Admin user"
   if [[ -n "$user_home" ]]; then
     vpass "User $ADMIN_USER exists"
-    if id -nG "$ADMIN_USER" | tr ' ' '\n' | grep -qx sudo; then vpass "$ADMIN_USER has sudo"
+    if [[ "$ADMIN_SUDO_NOPASSWD" == yes ]]; then
+      if runuser -u "$ADMIN_USER" -- sudo -n -v && runuser -u "$ADMIN_USER" -- sudo -n true; then
+        vpass "$ADMIN_USER can validate and execute passwordless sudo"
+      else
+        vfail "$ADMIN_USER's passwordless sudo policy is not effective"
+        vhint "Review sudo -l -U $ADMIN_USER and other sudoers rules for this user"
+      fi
+    elif id -nG "$ADMIN_USER" | tr ' ' '\n' | grep -qx sudo; then vpass "$ADMIN_USER has sudo"
     else vfail "$ADMIN_USER is not in the sudo group"; vhint "Fix: usermod -aG sudo $ADMIN_USER"
     fi
     (( keys > 0 )) && vpass "$ADMIN_USER has $keys SSH key(s)" || true
@@ -374,9 +510,39 @@ run_verify() {
     vfail "User $ADMIN_USER does not exist"
   fi
 
+  section "Other accounts"
+  # Provider images often leave a second sudo account behind (Vultr's "linuxuser", cloud images' "ubuntu").
+  # Such an account with a password or sudo rights is a login path the owner may not know about.
+  local other others=0 status
+  while IFS=: read -r other _ uid _ _ _ shell; do
+    [[ "$other" == "$ADMIN_USER" || "$shell" == */nologin || "$shell" == */false ]] && continue
+    (( uid >= 1000 || uid == 0 )) || continue
+    status="$(passwd -S "$other" 2>/dev/null | awk '{print $2}')"
+    if [[ "$status" == P ]]; then
+      others=$((others + 1)); vwarn "$other can log in with a password"
+      vhint "Lock it if it is a leftover provider account: sudo passwd -l $other"
+    fi
+    if [[ "$other" != root ]] && { id -nG "$other" 2>/dev/null | tr ' ' '\n' | grep -qxE 'sudo|admin' \
+         || grep -qsE "^[[:space:]]*${other}[[:space:]]" /etc/sudoers /etc/sudoers.d/*; }; then
+      others=$((others + 1)); vwarn "$other also has sudo rights"
+      vhint "Remove it if nobody uses it: sudo deluser --remove-home $other"
+    fi
+  done < /etc/passwd
+  (( others == 0 )) && vpass "No other account with a password or sudo rights" || true
+
   section "Firewall"
   if ufw status 2>/dev/null | grep -q '^Status: active'; then vpass "UFW is active"
   else vfail "UFW is NOT active"; vhint "Choose 'Run setup again' to fix"
+  fi
+  if ufw status verbose 2>/dev/null | grep -q 'Default: deny (incoming), allow (outgoing), deny (routed)'; then
+    vpass "UFW default policy denies incoming and routed traffic"
+  else
+    vfail "UFW default policy differs from the intended deny policy"; vhint "Review sudo ufw status verbose"
+  fi
+  if grep -qx 'IPV6=yes' /etc/default/ufw; then
+    vpass "UFW manages IPv6"
+  else
+    vfail "UFW IPv6 protection is disabled"; vhint "Enable IPV6=yes in /etc/default/ufw and reload UFW after checking SSH access"
   fi
   # Simple rules only ("ufw allow 80/tcp"); rules with from/to addresses are left alone.
   local -a rules=() expected=("$SSH_PORT/tcp")
@@ -449,11 +615,11 @@ run_verify() {
   fi
 
   section "Updates"
-  if systemctl is-enabled --quiet unattended-upgrades 2>/dev/null \
-     && grep -q 'Unattended-Upgrade "1"' /etc/apt/apt.conf.d/20auto-upgrades 2>/dev/null; then
+  if automatic_updates_enabled; then
     vpass "Automatic security updates are on (auto-reboot: $AUTO_REBOOT$([[ "$AUTO_REBOOT" == yes ]] && echo " at $AUTO_REBOOT_TIME"))"
   else
     vfail "Automatic security updates are NOT on"
+    vhint "Review apt-config dump and systemctl status apt-daily-upgrade.timer unattended-upgrades"
   fi
   if [[ -f /var/run/reboot-required ]]; then
     vwarn "A reboot is pending to finish installing updates"; vhint "Run: sudo reboot"
@@ -462,32 +628,56 @@ run_verify() {
   fi
 
   section "System"
-  [[ "$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)" == "bbr" ]] \
-    && vpass "BBR congestion control is active" || vwarn "BBR is not active ($(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null))"
+  if [[ "$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)" == "bbr" ]]; then
+    vpass "BBR congestion control is active"
+  else vwarn "BBR is not active"; vhint "Check sysctl net.ipv4.tcp_congestion_control"
+  fi
   if [[ -n "$(swapon --show --noheadings 2>/dev/null)" ]]; then vpass "Swap: $(swapon --show --noheadings | awk '{print $1" "$3}' | head -1)"
   elif [[ "$SWAP_SIZE" == "none" ]]; then vpass "No swap (as configured)"
   else vwarn "No swap is active"
   fi
-  aa-status --enabled 2>/dev/null && vpass "AppArmor is enabled" || vwarn "AppArmor is not enabled"
-  [[ "$(timedatectl show -p NTPSynchronized --value 2>/dev/null)" == "yes" ]] \
-    && vpass "Clock is synced" || vwarn "Clock is not synced yet (check: timedatectl)"
+  if aa-status --enabled 2>/dev/null; then vpass "AppArmor is enabled"
+  else vwarn "AppArmor is not enabled"; vhint "Check sudo aa-status"
+  fi
+  if [[ "$(timedatectl show -p NTPSynchronized --value 2>/dev/null)" == "yes" ]]; then vpass "Clock is synced"
+  else vwarn "Clock is not synced yet"; vhint "Check timedatectl"
+  fi
 
-  if [[ "$INSTALL_DOCKER" == "yes" ]]; then
+  if command -v docker >/dev/null; then
     section "Docker"
     if systemctl is-active --quiet docker; then
       vpass "Docker is running"
-      local public
-      public="$(docker ps --format '{{.Names}}\t{{.Ports}}' 2>/dev/null | grep -E '0\.0\.0\.0:|\[::\]:' || true)"
-      if [[ -n "$public" ]]; then
-        vwarn "These containers publish ports to the internet (Docker bypasses UFW):"
-        sed 's/^/        /' <<< "$public"
-        vhint "If that's not intended, bind to localhost: -p 127.0.0.1:PORT:PORT"
+      local containers container details
+      if ! containers="$(docker ps -q)"; then
+        vfail "Could not inspect Docker containers"; vhint "Check sudo docker ps"
       else
-        vpass "No container ports exposed past the firewall"
+        for container in $containers; do
+          if ! details="$(docker inspect "$container" | jq -r '
+            .[] | .Name as $name |
+            (if .HostConfig.NetworkMode == "host" then "\($name): host networking" else empty end),
+            ((.NetworkSettings.Ports // {}) | to_entries[] | .value[]? |
+              select((.HostIp | startswith("127.")) == false and .HostIp != "::1") |
+              "\($name): \(.HostIp):\(.HostPort)")')"; then
+            vfail "Could not inspect a Docker network binding"; vhint "Review sudo docker inspect $container"
+            continue
+          fi
+          if [[ -n "$details" ]]; then
+            vwarn "Docker has non-loopback port bindings or host networking:"
+            printf '        %s\n' "$details"
+            vhint "Check provider firewall and container networks; use localhost bindings for internal services"
+          fi
+        done
+        vhint "Published ports can bypass UFW. Also review routed, macvlan and ipvlan networks."
       fi
     else
-      vfail "Docker is NOT running"
+      if [[ "$INSTALL_DOCKER" == yes ]]; then
+        vfail "Docker is NOT running"; vhint "Check sudo systemctl status docker"
+      else
+        vpass "Docker is installed but inactive"
+      fi
     fi
+  elif [[ "$INSTALL_DOCKER" == yes ]]; then
+    vfail "Docker is configured but not installed"; vhint "Re-run setup with --docker"
   fi
 
   section "Security audit"
@@ -531,17 +721,29 @@ fi
 if [[ "$MODE" == "verify" ]]; then
   [[ -n "$SB_PREVIOUS" ]] || die "serverbeef hasn't set up this server yet — run it without --verify first."
   [[ "$SB_PREVIOUS" == "inferred" ]] && echo "  ${C_DIM}(No saved settings from an older version — read them from the system.)${C_RESET}" || true
+  FIREWALL_TCP_PORTS="$(none_to_empty "$FIREWALL_TCP_PORTS")"
+  FIREWALL_UDP_PORTS="$(none_to_empty "$FIREWALL_UDP_PORTS")"
+  if ! valid_user "$ADMIN_USER" || ! valid_port "$SSH_PORT" \
+    || ! valid_ports "$FIREWALL_TCP_PORTS" || ! valid_ports "$FIREWALL_UDP_PORTS"; then
+    die "Invalid saved verification settings; review $STATE_FILE"
+  fi
   run_verify && exit 0 || exit 1
 fi
 
 ROOT_KEYS=()
+ROOT_KEYS_SKIPPED=0
 if [[ -s /root/.ssh/authorized_keys ]]; then
-  while IFS= read -r line; do
+  while IFS= read -r line || [[ -n "$line" ]]; do
     k="$(extract_key "$line")"
-    [[ -n "$k" ]] && ROOT_KEYS+=("$k") || true
+    if [[ -n "$k" ]]; then ROOT_KEYS+=("$k")
+    elif [[ ! "$line" =~ ^[[:space:]]*(#.*)?$ ]]; then ROOT_KEYS_SKIPPED=$((ROOT_KEYS_SKIPPED + 1))
+    fi
   done < /root/.ssh/authorized_keys
 fi
 ROOT_KEY_COUNT=${#ROOT_KEYS[@]}
+if (( ROOT_KEYS_SKIPPED > 0 )); then
+  warn "Skipped $ROOT_KEYS_SKIPPED restricted or invalid root key line(s). Supply an unrestricted personal admin public key with --ssh-key."
+fi
 
 CURRENT_HOSTNAME="$(hostname)"
 CURRENT_TZ="$(timedatectl show -p Timezone --value 2>/dev/null || cat /etc/timezone 2>/dev/null || echo UTC)"
@@ -681,10 +883,11 @@ valid_hostname "$SET_HOSTNAME"                || die "Invalid hostname: $SET_HOS
 valid_timezone "$TIMEZONE"                    || die "Unknown timezone: $TIMEZONE"
 valid_swap "$SWAP_SIZE"                       || die "Invalid swap size: $SWAP_SIZE"
 valid_time "$AUTO_REBOOT_TIME"                || die "Invalid reboot time: $AUTO_REBOOT_TIME"
+valid_password "$ADMIN_PASSWORD"              || die "Passwords must not contain line breaks"
 [[ "$ADMIN_SUDO_NOPASSWD" =~ ^(yes|no|auto)$ ]] || die "Invalid ADMIN_SUDO_NOPASSWD: $ADMIN_SUDO_NOPASSWD"
 for v in COPY_ROOT_KEYS AUTO_REBOOT INSTALL_DOCKER; do valid_yesno "${!v}" || die "$v must be yes or no"; done
 while IFS= read -r k; do
-  [[ -z "$k" ]] || valid_sshkey "$k" || die "Invalid SSH public key: ${k:0:40}..."
+  [[ -z "$k" ]] || valid_sshkey "$k" || die "Invalid SSH public key (value omitted)"
 done <<< "$ADMIN_SSH_KEY"
 
 SWAP_REQUESTED="$SWAP_SIZE"   # step 9 turns "auto" into a size; save what was asked for
@@ -702,7 +905,8 @@ parts=()
 (( copied_keys > 0 ))     && parts+=("$copied_keys from root") || true
 (( ${user_keys:-0} > 0 )) && parts+=("$user_keys existing") || true
 if (( ${#parts[@]} )); then
-  key_summary="$(IFS=,; echo "${parts[*]}" | sed 's/,/, /g') → key-only login"
+  key_summary="$(IFS=,; echo "${parts[*]}")"
+  key_summary="${key_summary//,/, } → key-only login"
   [[ "$ADMIN_SUDO_NOPASSWD" == "auto" ]] && ADMIN_SUDO_NOPASSWD=yes || true
 else
   key_summary="none → password login stays ON"
@@ -713,7 +917,7 @@ cat <<EOF
 ${C_BLUE}serverbeef — about to configure this server:${C_RESET}
   Admin user ............ $ADMIN_USER
   SSH keys .............. $key_summary
-  Passwordless sudo ..... $ADMIN_SUDO_NOPASSWD$([[ "$GENERATE_PASSWORD" == yes ]] && echo " (password: auto-generated, shown at the end)")
+  Passwordless sudo ..... $ADMIN_SUDO_NOPASSWD$([[ "$GENERATE_PASSWORD" == yes ]] && echo " (password: auto-generated, delivered privately before the account update)")
   SSH port .............. $SSH_PORT (forwarding: $SSH_ALLOW_TCP_FORWARDING)$([[ "$SSH_PORT_RANDOM" == yes ]] && echo " ${C_YELLOW}picked at random: write it down and open it in your provider's firewall${C_RESET}")
   Public TCP ports ...... ${FIREWALL_TCP_PORTS:-none}
   Public UDP ports ...... ${FIREWALL_UDP_PORTS:-none}
@@ -731,6 +935,9 @@ elif [[ "$ASSUME_YES" != "yes" ]]; then
   die "No terminal available for the wizard. Re-run with --yes to use the values given by flags/env."
 fi
 
+# The log holds no secrets (passwords go to /dev/tty), but keep it root-only.
+[[ -e "$LOG_FILE" ]] || (umask 077; : > "$LOG_FILE")
+chmod 600 "$LOG_FILE"
 exec > >(tee -a "$LOG_FILE") 2>&1
 echo "=== serverbeef run started $(date -Is) ==="
 
@@ -740,7 +947,7 @@ step "1/11 Updating system and installing base packages"
 apt-get update -q
 apt-get "${APT_OPTS[@]}" full-upgrade
 apt-get "${APT_OPTS[@]}" install \
-  ca-certificates curl wget gnupg git unzip zip jq rsync \
+  ca-certificates curl wget gnupg git unzip zip jq rsync openssh-server sudo \
   htop btop ncdu tmux vim less bash-completion dnsutils net-tools \
   ufw fail2ban python3-systemd \
   unattended-upgrades apt-listchanges needrestart \
@@ -787,29 +994,45 @@ else
   NEW_USER=yes
   ok "User created"
 fi
-usermod -aG sudo "$ADMIN_USER"
-
 ADMIN_HOME="$(getent passwd "$ADMIN_USER" | cut -d: -f6)"
 AUTH_KEYS="$ADMIN_HOME/.ssh/authorized_keys"
-install -d -m 700 -o "$ADMIN_USER" -g "$ADMIN_USER" "$ADMIN_HOME/.ssh"
-touch "$AUTH_KEYS"
+# The home directory is user-controlled. Perform writes as that user so a
+# symlink swap cannot make this root process overwrite or chown a system file.
+# shellcheck disable=SC2016 # This program is interpreted by the child shell.
+runuser -u "$ADMIN_USER" -- bash -c '
+  set -e
+  umask 077
+  [[ ! -L "$1/.ssh" && ! -L "$2" ]]
+  mkdir -p -- "$1/.ssh"
+  chmod 700 -- "$1/.ssh"
+  [[ ! -e "$2" || ( -f "$2" && $(stat -c %h -- "$2") == 1 ) ]]
+  touch -- "$2"
+  chmod 600 -- "$2"
+' serverbeef "$ADMIN_HOME" "$AUTH_KEYS"
 
 add_key() {
   local key="$1"
   [[ -z "$key" || "$key" =~ ^# ]] && return 0
-  grep -qxF "$key" "$AUTH_KEYS" || echo "$key" >> "$AUTH_KEYS"
+  # shellcheck disable=SC2016 # This program is interpreted by the child shell.
+  printf '%s\n' "$key" | runuser -u "$ADMIN_USER" -- bash -c '
+    set -e
+    IFS= read -r key
+    [[ -f "$1" && ! -L "$1" && $(stat -c %h -- "$1") == 1 ]]
+    if ! grep -qxF -- "$key" "$1"; then
+      # A preceding key may lack a final newline.
+      [[ ! -s "$1" || -z "$(tail -c 1 -- "$1")" ]] || printf "\n" >> "$1"
+      printf "%s\n" "$key" >> "$1"
+    fi
+  ' serverbeef "$AUTH_KEYS"
 }
 if [[ -n "$ADMIN_SSH_KEY" ]]; then
   while IFS= read -r k; do add_key "$k"; done <<< "$ADMIN_SSH_KEY"
 fi
 if [[ "$COPY_ROOT_KEYS" == "yes" ]]; then
-  # Many VPS providers put your key on root; carry it over (without provider options).
+  # Copy only unrestricted validated keys; never remove provider restrictions.
   for k in "${ROOT_KEYS[@]}"; do add_key "$k"; done
 fi
-chown "$ADMIN_USER:$ADMIN_USER" "$AUTH_KEYS"
-chmod 600 "$AUTH_KEYS"
-
-KEY_COUNT="$(grep -cE '^(ssh-|ecdsa-|sk-)' "$AUTH_KEYS" || true)"
+KEY_COUNT="$(count_keys "$AUTH_KEYS")"
 if (( KEY_COUNT > 0 )); then
   ok "$KEY_COUNT SSH key(s) installed for $ADMIN_USER"
   HAVE_KEYS=yes
@@ -827,24 +1050,42 @@ HAS_PASSWORD=no
 passwd -S "$ADMIN_USER" 2>/dev/null | awk '{print $2}' | grep -q '^P' && HAS_PASSWORD=yes || true
 if [[ -z "$ADMIN_PASSWORD" && "$HAS_PASSWORD" == "no" ]] \
    && [[ "$GENERATE_PASSWORD" == "yes" || "$HAVE_KEYS" == "no" || "$ADMIN_SUDO_NOPASSWD" == "no" ]]; then
-  ADMIN_PASSWORD="$(LC_ALL=C tr -dc 'A-Za-z0-9' < /dev/urandom | head -c 20 || true)"
+  ADMIN_PASSWORD="$(od -An -N24 -tx1 /dev/urandom | tr -d ' \n')"
+  [[ ${#ADMIN_PASSWORD} -eq 48 ]] || die "Password generation failed"
   GENERATED_PASSWORD="$ADMIN_PASSWORD"
+  # shellcheck disable=SC2119
+  deliver_generated_password
 fi
 if [[ -n "$ADMIN_PASSWORD" ]]; then
   printf '%s:%s\n' "$ADMIN_USER" "$ADMIN_PASSWORD" | chpasswd
-  ok "Password set for $ADMIN_USER${GENERATED_PASSWORD:+ (generated — shown at the end)}"
+  ok "Password set for $ADMIN_USER${GENERATED_PASSWORD:+ (generated — delivered privately)}"
 fi
-unset ADMIN_PASSWORD
+unset ADMIN_PASSWORD GENERATED_PASSWORD
 SUDOERS_FILE="/etc/sudoers.d/90-${MARK}-${ADMIN_USER}"
 if [[ "$ADMIN_SUDO_NOPASSWD" == "yes" ]]; then
-  echo "$ADMIN_USER ALL=(ALL:ALL) NOPASSWD:ALL" > "$SUDOERS_FILE"
-  chmod 440 "$SUDOERS_FILE"
-  if command -v visudo >/dev/null && ! visudo -cf "$SUDOERS_FILE" >/dev/null; then
-    rm -f "$SUDOERS_FILE"; die "sudoers validation failed"
+  SUDOERS_TEMP="$(mktemp "/etc/sudoers.d/${MARK}-sudoers.XXXXXX")"
+  printf '# Managed by serverbeef.sh\n%s ALL=(ALL:ALL) NOPASSWD:ALL\n' "$ADMIN_USER" > "$SUDOERS_TEMP"
+  chmod 440 "$SUDOERS_TEMP"
+  if ! visudo -cf "$SUDOERS_TEMP" >/dev/null; then
+    mv "$SUDOERS_TEMP" "$SUDOERS_TEMP.broken"; die "sudoers validation failed; previous policy preserved"
+  fi
+  mv -fT "$SUDOERS_TEMP" "$SUDOERS_FILE"
+  # sudo-rs validates ALL matching entries for sudo -v. Combining a NOPASSWD
+  # user rule with Ubuntu's password-required %sudo rule still prompts. Grant
+  # this admin sudo directly and use ssh-users for SSH; keep other sudo users'
+  # authentication requirements intact.
+  getent group ssh-users >/dev/null || groupadd ssh-users
+  usermod -aG ssh-users "$ADMIN_USER"
+  if id -nG "$ADMIN_USER" | tr ' ' '\n' | grep -qx sudo; then
+    gpasswd -d "$ADMIN_USER" sudo >/dev/null
+  fi
+  if ! runuser -u "$ADMIN_USER" -- sudo -n -v || ! runuser -u "$ADMIN_USER" -- sudo -n true; then
+    die "Passwordless sudo conflicts with another policy. Review sudo -l -U $ADMIN_USER before changing SSH."
   fi
   ok "Passwordless sudo for $ADMIN_USER"
   [[ "$NEW_USER" == "yes" ]] && warn "$ADMIN_USER has passwordless sudo; protect that SSH key"
 else
+  usermod -aG sudo "$ADMIN_USER"
   rm -f "$SUDOERS_FILE"
   ok "sudo requires $ADMIN_USER's password"
 fi
@@ -855,6 +1096,18 @@ step "4/11 Hardening SSH"
 # sshd uses the FIRST value it sees, and sshd_config.d/*.conf is included at the
 # top of sshd_config, so a "00-" file overrides cloud-init's 50-cloud-init.conf.
 SSHD_DROPIN="/etc/ssh/sshd_config.d/00-${MARK}.conf"
+SSHD_PREVIOUS_PORTS="$(sshd -T 2>/dev/null | awk '$1=="port"{print $2}')" \
+  || die "Cannot read the existing SSH policy; repair it before setup"
+SSHD_BACKUP=""
+if [[ -e "$SSHD_DROPIN" ]]; then
+  SSHD_BACKUP="$(mktemp "/etc/ssh/sshd_config.d/${MARK}-previous.XXXXXX")"
+  cp -p "$SSHD_DROPIN" "$SSHD_BACKUP"
+fi
+SSHD_TEMP="$(mktemp "/etc/ssh/sshd_config.d/${MARK}-candidate.XXXXXX")"
+restore_sshd_dropin() {
+  mv -fT "$SSHD_DROPIN" "$SSHD_DROPIN.broken"
+  if [[ -n "$SSHD_BACKUP" ]]; then mv -fT "$SSHD_BACKUP" "$SSHD_DROPIN"; fi
+}
 if [[ "$HAVE_KEYS" == "yes" ]]; then
   AUTH_BLOCK="PermitRootLogin no
 PasswordAuthentication no
@@ -868,7 +1121,7 @@ else
 PasswordAuthentication yes"
   AUTH_DESC="password login ON for $ADMIN_USER (no key), root password login off"
 fi
-cat > "$SSHD_DROPIN" <<EOF
+cat > "$SSHD_TEMP" <<EOF
 # Managed by serverbeef.sh
 Port $SSH_PORT
 $AUTH_BLOCK
@@ -895,7 +1148,7 @@ UseDNS no
 LogLevel VERBOSE
 PrintMotd no
 EOF
-chmod 644 "$SSHD_DROPIN"
+chmod 644 "$SSHD_TEMP"
 # Group for non-sudo users you may want to allow SSH later (e.g. a CI deploy user):
 #   usermod -aG ssh-users <name>
 getent group ssh-users >/dev/null || groupadd ssh-users
@@ -905,16 +1158,24 @@ grep -qE '^\s*Include\s+/etc/ssh/sshd_config\.d/\*\.conf' /etc/ssh/sshd_config \
   || sed -i '1i Include /etc/ssh/sshd_config.d/*.conf' /etc/ssh/sshd_config
 
 mkdir -p /run/sshd
-if ! sshd -t; then
-  mv "$SSHD_DROPIN" "$SSHD_DROPIN.broken"
-  die "sshd config test failed — drop-in moved to $SSHD_DROPIN.broken, SSH left unchanged"
+mv -fT "$SSHD_TEMP" "$SSHD_DROPIN"
+if ! sshd -t || ! ssh_policy_ok; then
+  restore_sshd_dropin
+  die "SSH syntax or effective policy check failed — candidate moved to $SSHD_DROPIN.broken; previous drop-in restored. Review other SSH files and Match rules."
 fi
 ok "sshd config valid ($AUTH_DESC)"
+# Keep the previous on-disk SSH configuration until the firewall is ready.
+# An interrupted firewall step must not leave a new SSH port active on reboot.
+mv -fT "$SSHD_DROPIN" "$SSHD_TEMP"
+if [[ -n "$SSHD_BACKUP" ]]; then cp -p "$SSHD_BACKUP" "$SSHD_DROPIN"; fi
 # SSH is restarted after the firewall allows the new port (step 5).
 
 # ============================================================================
 step "5/11 Firewall (UFW)"
 # ============================================================================
+# Apply the firewall to both address families, including an existing IPv6 VPS.
+sed -i 's/^IPV6=.*/IPV6=yes/' /etc/default/ufw
+grep -qx 'IPV6=yes' /etc/default/ufw || die "Could not enable UFW IPv6 protection"
 ufw default deny incoming >/dev/null
 ufw default allow outgoing >/dev/null
 ufw default deny routed >/dev/null
@@ -935,18 +1196,29 @@ fi
 
 # Now apply SSH config. Ubuntu uses socket activation (ssh.socket), whose
 # listening port is generated from sshd_config — hence daemon-reload.
+mv -fT "$SSHD_TEMP" "$SSHD_DROPIN"
 systemctl daemon-reload
-if systemctl is-enabled --quiet ssh.socket 2>/dev/null; then
-  systemctl restart ssh.socket ssh.service
-else
-  systemctl restart ssh.service
-fi
-sleep 1
-if ss -tln | grep -qE "[:.]${SSH_PORT}\s"; then
+restart_ssh() {
+  if systemctl is-enabled --quiet ssh.socket 2>/dev/null; then
+    systemctl restart ssh.socket ssh.service
+  else
+    systemctl restart ssh.service
+  fi
+}
+if restart_ssh && sleep 1 && ss -tlnpH | grep -E '("sshd"|"systemd")' | awk '{print $4}' | grep -qE "[:.]${SSH_PORT}$"; then
   ok "SSH listening on port $SSH_PORT"
 else
-  warn "Could not confirm SSH is listening on $SSH_PORT — check 'ss -tlnp' BEFORE closing this session"
+  restore_sshd_dropin
+  # A fresh UFW setup may have blocked the previous SSH port. Reopen it before
+  # activating the restored policy, retaining the new rule for recovery too.
+  for p in $SSHD_PREVIOUS_PORTS; do
+    if valid_port "$p"; then ufw limit "$p/tcp" comment "SSH rollback" >/dev/null || true; fi
+  done
+  systemctl daemon-reload
+  restart_ssh || true
+  die "SSH activation failed; previous drop-in restored. Keep this session open and check SSH and firewall access."
 fi
+[[ -z "$SSHD_BACKUP" ]] || rm -f "$SSHD_BACKUP"
 
 # ============================================================================
 step "6/11 Fail2ban"
@@ -981,13 +1253,16 @@ EOF
 systemctl enable fail2ban >/dev/null 2>&1
 systemctl restart fail2ban
 sleep 2
-fail2ban-client status sshd >/dev/null 2>&1 && ok "Fail2ban active (sshd + recidive jails)" \
-  || warn "Fail2ban did not start cleanly — check: journalctl -u fail2ban"
+if fail2ban-client status sshd >/dev/null 2>&1 && fail2ban-client status recidive >/dev/null 2>&1; then
+  ok "Fail2ban active (sshd + recidive jails)"
+else warn "Fail2ban did not start cleanly — check: journalctl -u fail2ban"
+fi
 
 # ============================================================================
 step "7/11 Automatic security updates"
 # ============================================================================
-cat > /etc/apt/apt.conf.d/20auto-upgrades <<'EOF'
+cat > /etc/apt/apt.conf.d/90${MARK}-periodic <<'EOF'
+// Managed by serverbeef.sh
 APT::Periodic::Update-Package-Lists "1";
 APT::Periodic::Download-Upgradeable-Packages "1";
 APT::Periodic::Unattended-Upgrade "1";
@@ -1010,7 +1285,7 @@ ok "Unattended security upgrades enabled (auto-reboot: $AUTO_REBOOT @ $AUTO_REBO
 step "8/11 Kernel hardening + network performance tuning"
 # ============================================================================
 modprobe tcp_bbr 2>/dev/null || true
-echo tcp_bbr > /etc/modules-load.d/${MARK}-bbr.conf
+printf '# Managed by serverbeef.sh\ntcp_bbr\n' > /etc/modules-load.d/${MARK}-bbr.conf
 
 cat > /etc/sysctl.d/90-${MARK}.conf <<'EOF'
 # Managed by serverbeef.sh
@@ -1095,8 +1370,8 @@ if [[ "$SWAP_SIZE" != "none" ]] && [[ -z "$(swapon --show --noheadings)" ]]; the
   if [[ "$root_fs" == "btrfs" ]]; then
     btrfs filesystem mkswapfile --size "$SWAP_SIZE" /swapfile >/dev/null
   else
-    fallocate -l "$SWAP_SIZE" /swapfile 2>/dev/null \
-      || dd if=/dev/zero of=/swapfile bs=1M count="$(numfmt --from=iec "$SWAP_SIZE" | awk '{print int($1/1048576)}')" status=none
+    (umask 077; fallocate -l "$SWAP_SIZE" /swapfile 2>/dev/null \
+      || dd if=/dev/zero of=/swapfile bs=1M count="$(numfmt --from=iec "$SWAP_SIZE" | awk '{print int($1/1048576)}')" status=none)
     chmod 600 /swapfile
     mkswap /swapfile >/dev/null
   fi
@@ -1119,12 +1394,14 @@ root hard nofile 1048576
 EOF
 mkdir -p /etc/systemd/system.conf.d
 cat > /etc/systemd/system.conf.d/90-${MARK}.conf <<'EOF'
+# Managed by serverbeef.sh
 [Manager]
 DefaultLimitNOFILE=65535:1048576
 EOF
 
 mkdir -p /etc/systemd/journald.conf.d
 cat > /etc/systemd/journald.conf.d/90-${MARK}.conf <<'EOF'
+# Managed by serverbeef.sh
 [Journal]
 Storage=persistent
 Compress=yes
@@ -1141,11 +1418,13 @@ step "10/11 Misc hardening"
 # ============================================================================
 # No core dumps (can leak secrets from app memory)
 mkdir -p /etc/systemd/coredump.conf.d
-printf '[Coredump]\nStorage=none\nProcessSizeMax=0\n' > /etc/systemd/coredump.conf.d/90-${MARK}.conf
+printf '# Managed by serverbeef.sh\n[Coredump]\nStorage=none\nProcessSizeMax=0\n' > /etc/systemd/coredump.conf.d/90-${MARK}.conf
 
 # AppArmor on
 systemctl enable --now apparmor >/dev/null 2>&1 || true
-aa-status --enabled 2>/dev/null && ok "AppArmor enabled" || warn "AppArmor is not enabled (normal in some containers)"
+if aa-status --enabled 2>/dev/null; then ok "AppArmor enabled"
+else warn "AppArmor is not enabled (normal in some containers)"
+fi
 
 # Don't let Ctrl-Alt-Del from a provider console reboot the box
 systemctl mask ctrl-alt-del.target >/dev/null 2>&1 || true
@@ -1162,6 +1441,7 @@ fi
 
 # Disable rarely-needed network protocols & filesystems
 cat > /etc/modprobe.d/90-${MARK}-blacklist.conf <<'EOF'
+# Managed by serverbeef.sh
 install dccp /bin/false
 install sctp /bin/false
 install rds /bin/false
@@ -1204,14 +1484,16 @@ fi
 install -d -m 700 "$STATE_DIR"
 SWAP_SIZE="$SWAP_REQUESTED"
 {
-  echo "# Written by serverbeef.sh after a successful run. Used as defaults on re-run."
+  echo "# Managed by serverbeef.sh. Used as defaults on re-run."
   echo "SB_LAST_RUN=\"$(date '+%Y-%m-%d %H:%M')\""
   for key in $STATE_KEYS; do echo "$key=\"${!key}\""; done
 } > "$STATE_FILE"
 chmod 600 "$STATE_FILE"
 # Keep a copy so re-running is just: sudo serverbeef
 if [[ -f "${BASH_SOURCE[0]}" ]]; then
-  install -m 755 "${BASH_SOURCE[0]}" /usr/local/sbin/serverbeef
+  if [[ ! "${BASH_SOURCE[0]}" -ef /usr/local/sbin/serverbeef ]]; then
+    install -m 755 "${BASH_SOURCE[0]}" /usr/local/sbin/serverbeef
+  fi
   RERUN_CMD="sudo serverbeef"
 else
   RERUN_CMD="sudo bash serverbeef.sh"
@@ -1223,7 +1505,11 @@ fi
 IP="$(curl -fsS -4 --max-time 5 https://ifconfig.me 2>/dev/null || hostname -I | awk '{print $1}')"
 echo
 echo "${C_GREEN}=============================================================${C_RESET}"
-echo "${C_GREEN} serverbeef complete${C_RESET}  (log: $LOG_FILE)"
+if [[ "$HAVE_KEYS" == yes ]]; then
+  echo "${C_GREEN} serverbeef setup finished — verify the new login${C_RESET}  (log: $LOG_FILE)"
+else
+  echo "${C_YELLOW} serverbeef INCOMPLETE — no validated admin key${C_RESET}  (log: $LOG_FILE)"
+fi
 echo "${C_GREEN}=============================================================${C_RESET}"
 cat <<EOF
 
@@ -1258,25 +1544,4 @@ if [[ -f /var/run/reboot-required ]]; then
 fi
 echo
 
-# Show a generated password once — straight to the terminal, never into the log.
-if [[ -n "$GENERATED_PASSWORD" ]]; then
-  msg="$(cat <<EOF
-${C_YELLOW}┌──────────────────────────────────────────────────────────┐
-│  Generated password for $ADMIN_USER — SAVE IT NOW, shown once:
-│
-│      ${C_BOLD}$GENERATED_PASSWORD${C_RESET}${C_YELLOW}
-│
-│  Used for: sudo$([[ "$HAVE_KEYS" == "no" ]] && echo " and SSH login")
-│  Change it any time with: passwd
-└──────────────────────────────────────────────────────────┘${C_RESET}
-EOF
-)"
-  if { printf '%s\n\n' "$msg" > /dev/tty; } 2>/dev/null; then
-    :
-  else
-    CRED_FILE="/root/serverbeef-${ADMIN_USER}-password.txt"
-    (umask 077; printf '%s\n' "$GENERATED_PASSWORD" > "$CRED_FILE")
-    echo " Generated password for $ADMIN_USER saved to $CRED_FILE (root-only). Delete it after saving it elsewhere."
-  fi
-  unset GENERATED_PASSWORD msg
-fi
+[[ "$HAVE_KEYS" == yes ]] || exit 1

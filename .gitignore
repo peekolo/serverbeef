@@ -1,3 +1,4 @@
 # local settings files for --config may hold keys or passwords
 *.conf
 *.env
+__pycache__/
