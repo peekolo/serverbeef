@@ -60,8 +60,8 @@ of them. Answer these ones yourself:
 - When it asks for a public key, paste the line you copied in step 1. Only copy keys from root if you recognize
   them as your personal admin keys. Restricted root keys are skipped; their restrictions are never stripped.
 - If your app runs in Docker, answer yes to the Docker question and keep the rootless mode: the Docker daemon
-  then runs as a normal user, so nothing inside a container can reach root. If an AI assistant or CI will do
-  the deployments, give Docker its own user (`deploy`) instead of your admin account.
+  then runs as a separate user, `deploy`, so nothing inside a container can reach root, and an AI assistant or
+  CI that deploys through Docker works as `deploy`, never as your admin account.
 
 Before it changes anything, it shows a summary and asks you to confirm. Find the SSH port there (a number
 like `4821`) and write it down: from now on you log in on that port. At the end it prints the exact login command.
@@ -137,7 +137,7 @@ pipe anything from the internet into a root shell.
 | 8. Kernel, network | BBR and fq, larger queues and buffers, SYN cookies, no redirects or source routing, restricted kernel pointers, dmesg, ptrace and unprivileged BPF |
 | 9. Swap, limits, logs | A swap file sized to RAM (1 to 4 GB) if there is none, higher open-file limits, journald capped at 1 GB and one month |
 | 10. Misc | Core dumps off, `su` limited to the sudo group, home folders private, unused protocols and filesystems blocked, Ctrl-Alt-Del from the provider console ignored |
-| 11. Docker (optional) | Rootless Docker and Compose from Ubuntu's packages: the daemon runs as the Docker user (the admin, or `--docker-user deploy`, created if missing), the root daemon is off and masked, nobody is in the `docker` group, ports 80 and 443 can be published without root, pasta keeps the visitor's source address, log rotation. `--docker-rootful` installs the classic root daemon instead |
+| 11. Docker (optional) | Rootless Docker and Compose from Ubuntu's packages: the daemon runs as a separate Docker user (`deploy` unless `--docker-user` says otherwise, created if missing, no sudo), the root daemon is off and masked, nobody is in the `docker` group, ports 80 and 443 can be published without root, pasta keeps the visitor's source address, log rotation. `--docker-rootful` installs the classic root daemon instead |
 
 Managed drop-ins have `serverbeef` in their name (`/etc/ssh/sshd_config.d/00-serverbeef.conf`,
 `/etc/sysctl.d/90-serverbeef.conf` and so on), so you can see what came from the script. A few shared files, such
@@ -161,7 +161,7 @@ saved in `/etc/serverbeef/state.conf` (never passwords or keys), and the script 
 | `--swap auto\|none\|2G` | `auto` | Swap file size |
 | `--auto-reboot` / `--no-auto-reboot`, `--reboot-time HH:MM` | on, `04:00` | Reboots after updates |
 | `--docker` / `--no-docker` | off | Install rootless Docker and Compose |
-| `--docker-user NAME` | the admin | User who runs rootless Docker (created if missing) |
+| `--docker-user NAME` | `deploy` | User who runs rootless Docker (created if missing, no sudo). Changing it on a re-run stops the previous user's daemon |
 | `--docker-rootful` | | The classic root daemon instead of rootless Docker |
 | `--verify` | | Check a server this script already set up |
 | `--setup` | | On a re-run, skip the menu and run setup again |

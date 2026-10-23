@@ -47,6 +47,7 @@ STATE_DIR="/etc/serverbeef"
 STATE_FILE="$STATE_DIR/state.conf"
 STATE_KEYS="ADMIN_USER ADMIN_SUDO_NOPASSWD SSH_PORT SSH_ALLOW_TCP_FORWARDING FIREWALL_TCP_PORTS FIREWALL_UDP_PORTS SWAP_SIZE AUTO_REBOOT AUTO_REBOOT_TIME INSTALL_DOCKER DOCKER_MODE DOCKER_USER"
 SB_PREVIOUS=""        # "", "state" (saved settings) or "inferred" (older version, no state file)
+SB_PREV_DOCKER_USER="" # who ran rootless Docker before this run (from the state file)
 SB_LAST_RUN=""
 
 set_if_unset() { [[ -z "${!1+x}" && -n "$2" ]] && printf -v "$1" '%s' "$2" || true; }
@@ -57,6 +58,7 @@ if [[ -r "$STATE_FILE" ]]; then
     [[ "$line" =~ ^([A-Z_]+)=\"([^\"]*)\"$ ]] || continue
     key="${BASH_REMATCH[1]}"; val="${BASH_REMATCH[2]}"
     if [[ "$key" == "SB_LAST_RUN" ]]; then SB_LAST_RUN="$val"
+    elif [[ "$key" == "DOCKER_USER" ]]; then SB_PREV_DOCKER_USER="$val"; [[ -n "${!key+x}" ]] || printf -v "$key" '%s' "$val"
     elif [[ " $STATE_KEYS " == *" $key "* && -z "${!key+x}" ]]; then printf -v "$key" '%s' "$val"   # empty is a real answer (e.g. no UDP ports)
     fi
   done < "$STATE_FILE"
@@ -110,7 +112,8 @@ AUTO_REBOOT_TIME="${AUTO_REBOOT_TIME:-04:00}"
 
 INSTALL_DOCKER="${INSTALL_DOCKER:-no}"          # yes | no
 DOCKER_MODE="${DOCKER_MODE:-rootless}"          # rootless (daemon runs as DOCKER_USER, never root) | rootful (classic root daemon)
-DOCKER_USER="${DOCKER_USER:-}"                  # who runs rootless Docker; empty = the admin user. Created if missing
+DOCKER_USER="${DOCKER_USER:-deploy}"            # who runs rootless Docker, created if missing. A separate user, so that
+                                                # deployments (CI, agents) never run as the admin
 ASSUME_YES="${ASSUME_YES:-no}"
 MODE=""                                         # "" (ask) | setup | verify
 
@@ -144,7 +147,7 @@ Options:
       --reboot-time HH:MM    Time for automatic reboots           [04:00]
       --docker               Install rootless Docker + Compose: the daemon
                              runs as --docker-user, never as root
-      --docker-user NAME     User who runs Docker (created if missing) [admin]
+      --docker-user NAME     User who runs Docker (created if missing) [deploy]
       --docker-rootful       Install the classic root Docker daemon instead
       --no-docker            Don't install Docker (default)
       --verify               Check an already set-up server (and offer fixes)
@@ -356,13 +359,23 @@ WantedBy=default.target
 Alias=docker.service
 EOF
 }
-# as_docker_user CMD...: run CMD as DOCKER_USER with what its systemd user instance and Docker need
-as_docker_user() {
-  local uid home
-  uid="$(id -u "$DOCKER_USER")"; home="$(getent passwd "$DOCKER_USER" | cut -d: -f6)"
-  runuser -u "$DOCKER_USER" -- env HOME="$home" USER="$DOCKER_USER" LOGNAME="$DOCKER_USER" \
+# as_user USER CMD...: run CMD as USER with what its systemd user instance and rootless Docker need
+as_user() {
+  local user="$1" uid home; shift
+  uid="$(id -u "$user")"; home="$(getent passwd "$user" | cut -d: -f6)"
+  runuser -u "$user" -- env HOME="$home" USER="$user" LOGNAME="$user" \
     XDG_RUNTIME_DIR="/run/user/$uid" DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$uid/bus" \
     DOCKER_HOST="unix:///run/user/$uid/docker.sock" "$@"
+}
+as_docker_user() { as_user "$DOCKER_USER" "$@"; }
+# other_rootless_daemons: users other than DOCKER_USER that have this script's rootless Docker unit
+other_rootless_daemons() {
+  local unit user
+  for unit in /home/*/.config/systemd/user/"${MARK}"-docker.service; do
+    [[ -f "$unit" ]] || continue
+    user="${unit#/home/}"; user="${user%%/*}"
+    [[ "$user" == "$DOCKER_USER" ]] || echo "$user"
+  done
 }
 # dockerctl ARGS...: the docker CLI against the daemon this server is configured for
 dockerctl() {
@@ -556,7 +569,7 @@ verify_docker_bindings() {
   [[ "$1" == rootless ]] || vhint "Published ports can bypass UFW. Also review routed, macvlan and ipvlan networks."
 }
 verify_rootless_docker() {
-  local members uid environment
+  local members uid environment other
   if systemctl is-active --quiet docker; then
     vfail "The root Docker daemon is running: whoever can use it is root"
     vhint "Fix: sudo systemctl disable --now docker.service docker.socket && sudo systemctl mask docker.service docker.socket"
@@ -580,6 +593,9 @@ verify_rootless_docker() {
   if [[ "$DOCKER_USER" != "$ADMIN_USER" ]] && sudo -l -U "$DOCKER_USER" 2>/dev/null | grep -q '(ALL'; then
     vwarn "$DOCKER_USER has sudo rights; a deploy user should have none"; vhint "Review sudo -l -U $DOCKER_USER"
   fi
+  for other in $(other_rootless_daemons); do
+    vwarn "$other also has a rootless Docker daemon configured"; vhint "Fix: re-run setup with --docker-user $DOCKER_USER (it stops the other one), or: sudo -iu $other systemctl --user disable --now ${MARK}-docker"
+  done
   uid="$(id -u "$DOCKER_USER")"
   if [[ "$(loginctl show-user "$DOCKER_USER" -p Linger --value 2>/dev/null)" == yes ]]; then vpass "$DOCKER_USER's daemon starts at boot (linger)"
   else vfail "$DOCKER_USER's daemon will not start at boot"; vhint "Fix: sudo loginctl enable-linger $DOCKER_USER"
@@ -996,8 +1012,8 @@ EOF
   if [[ "$INSTALL_DOCKER" == "yes" ]]; then
     ask DOCKER_MODE "Docker mode (rootless/rootful)" valid_docker_mode "rootless: the daemon runs as a normal user and containers can never reach root. rootful: the classic root daemon; whoever may use it is root."
     if [[ "$DOCKER_MODE" == "rootless" ]]; then
-      [[ -n "$DOCKER_USER" ]] || DOCKER_USER="$ADMIN_USER"
-      ask DOCKER_USER "User who runs Docker" valid_user "Created if missing. Use a separate user (e.g. deploy) when agents or CI deploy without sudo."
+      [[ -n "$DOCKER_USER" ]] || DOCKER_USER=deploy
+      ask DOCKER_USER "User who runs Docker" valid_user "Created if missing, no sudo. Keep it separate from $ADMIN_USER so that deployments (CI, agents) never run as the admin."
     fi
   fi
 fi
@@ -1013,7 +1029,7 @@ FIREWALL_TCP_PORTS="$(none_to_empty "$FIREWALL_TCP_PORTS")"
 FIREWALL_UDP_PORTS="$(none_to_empty "$FIREWALL_UDP_PORTS")"
 for v in COPY_ROOT_KEYS AUTO_REBOOT INSTALL_DOCKER; do printf -v "$v" '%s' "$(yesno "${!v}")"; done
 [[ "$ADMIN_SUDO_NOPASSWD" == "auto" ]] || ADMIN_SUDO_NOPASSWD="$(yesno "$ADMIN_SUDO_NOPASSWD")"
-[[ -n "$DOCKER_USER" ]] || DOCKER_USER="$ADMIN_USER"
+[[ -n "$DOCKER_USER" ]] || DOCKER_USER=deploy
 
 valid_user "$ADMIN_USER"                      || die "Invalid admin user: $ADMIN_USER"
 valid_port "$SSH_PORT"                        || die "Invalid SSH port: $SSH_PORT"
@@ -1627,6 +1643,15 @@ if [[ "$INSTALL_DOCKER" == "yes" && "$DOCKER_MODE" == "rootless" ]]; then
 net.ipv4.ip_unprivileged_port_start = 80
 EOF
   sysctl -q -p "/etc/sysctl.d/90-${MARK}-rootless-docker.conf"
+  # The Docker user changed since the last run: the old user's daemon must not keep running next to the new one.
+  for old in $(other_rootless_daemons); do
+    [[ "$old" == "$SB_PREV_DOCKER_USER" ]] || continue
+    as_user "$old" systemctl --user disable --now "${MARK}-docker.service" >/dev/null 2>&1 || true
+    rm -f "/home/$old/.config/systemd/user/${MARK}-docker.service"
+    as_user "$old" systemctl --user daemon-reload >/dev/null 2>&1 || true
+    loginctl disable-linger "$old" 2>/dev/null || true
+    warn "Rootless Docker for $old stopped and disabled: $DOCKER_USER runs it now. Its images and containers stay in /home/$old/.local/share/docker; remove that directory if you do not need them"
+  done
   if ! id "$DOCKER_USER" &>/dev/null; then
     adduser --disabled-password --gecos "" "$DOCKER_USER" >/dev/null
     ok "User $DOCKER_USER created: no password, no sudo. Add SSH keys to its authorized_keys to let it log in"
