@@ -26,7 +26,7 @@ HELPERS = "".join(function(name) for name in (
     "load_config", "valid_port", "valid_ports", "valid_sshkey",
     "valid_password", "extract_key", "count_keys", "ssh_policy_ok",
     "restore_sshd_dropin", "add_key", "deliver_generated_password", "automatic_updates_enabled",
-    "random_port",
+    "random_port", "rootless_docker_unit", "docker_group_members", "next_subid_range",
 ))
 STATE_KEYS = re.search(r'^STATE_KEYS="([^"]+)"', SOURCE, re.M)[1]
 
@@ -118,6 +118,39 @@ class SecurityTests(unittest.TestCase):
             port = int(result.stdout)
             self.assertTrue(1025 <= port <= 9999, port)
             self.assertNotIn(str(port), common)
+
+    def test_rootless_docker_unit_keeps_source_addresses_and_runs_given_script(self):
+        result = self.shell('rootless_docker_unit /usr/share/docker.io/contrib/dockerd-rootless.sh')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        unit = result.stdout
+        self.assertIn("Environment=DOCKERD_ROOTLESS_ROOTLESSKIT_NET=pasta\n", unit)
+        self.assertIn("Environment=DOCKERD_ROOTLESS_ROOTLESSKIT_PORT_DRIVER=implicit\n", unit)
+        self.assertIn("ExecStart=/usr/share/docker.io/contrib/dockerd-rootless.sh\n", unit)
+        self.assertIn("ExecReload=/bin/kill -s HUP $MAINPID\n", unit)
+        self.assertIn("WantedBy=default.target\n", unit)
+
+    def test_docker_group_members_ignores_root_and_empty_group(self):
+        for line, expected in (("docker:x:107:", ""), ("docker:x:107:root", ""),
+                               ("docker:x:107:alice,root,bob", "alice\nbob\n"), ("", "")):
+            with self.subTest(line=line):
+                result = self.shell(f'getent() {{ printf "%s\\n" "{line}"; }}; docker_group_members')
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout, expected)
+
+    def test_next_subid_range_starts_above_existing_ranges(self):
+        subuid = self.directory / "subuid"
+        for content, expected in (("", "100000-165535"),
+                                  ("alice:100000:65536\n", "165536-231071"),
+                                  ("alice:100000:65536\nbob:231072:65536\n", "296608-362143"),
+                                  ("broken line\n", "100000-165535")):
+            with self.subTest(content=content):
+                subuid.write_text(content)
+                result = self.shell('next_subid_range "$1"', str(subuid))
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout.strip(), expected)
+        result = self.shell('next_subid_range "$1"', str(self.directory / "missing"))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), "100000-165535")
 
     def test_cli_does_not_trace_config_password(self):
         config = self.directory / "trace-config"

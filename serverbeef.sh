@@ -45,7 +45,7 @@ set -Eeuo pipefail
 # On the next run they become the defaults, unless overridden by env or flags.
 STATE_DIR="/etc/serverbeef"
 STATE_FILE="$STATE_DIR/state.conf"
-STATE_KEYS="ADMIN_USER ADMIN_SUDO_NOPASSWD SSH_PORT SSH_ALLOW_TCP_FORWARDING FIREWALL_TCP_PORTS FIREWALL_UDP_PORTS SWAP_SIZE AUTO_REBOOT AUTO_REBOOT_TIME INSTALL_DOCKER"
+STATE_KEYS="ADMIN_USER ADMIN_SUDO_NOPASSWD SSH_PORT SSH_ALLOW_TCP_FORWARDING FIREWALL_TCP_PORTS FIREWALL_UDP_PORTS SWAP_SIZE AUTO_REBOOT AUTO_REBOOT_TIME INSTALL_DOCKER DOCKER_MODE DOCKER_USER"
 SB_PREVIOUS=""        # "", "state" (saved settings) or "inferred" (older version, no state file)
 SB_LAST_RUN=""
 
@@ -77,8 +77,13 @@ elif [[ -f /etc/ssh/sshd_config.d/00-serverbeef.conf ]]; then
     [[ -n "${FIREWALL_TCP_PORTS+x}" ]] || FIREWALL_TCP_PORTS="$(ufw show added 2>/dev/null | sed -nE "s/^ufw allow ([0-9:]+)\/tcp comment 'public'$/\1/p" | xargs)"
     [[ -n "${FIREWALL_UDP_PORTS+x}" ]] || FIREWALL_UDP_PORTS="$(ufw show added 2>/dev/null | sed -nE "s/^ufw allow ([0-9:]+)\/udp comment 'public'$/\1/p" | xargs)"
   fi
-  command -v docker >/dev/null && set_if_unset INSTALL_DOCKER yes || true
+  if command -v docker >/dev/null; then set_if_unset INSTALL_DOCKER yes; set_if_unset DOCKER_MODE rootful; fi
   grep -q 'Automatic-Reboot "false"' /etc/apt/apt.conf.d/52serverbeef-unattended-upgrades 2>/dev/null && set_if_unset AUTO_REBOOT no || true
+fi
+
+# A server set up before Docker had a mode keeps its root daemon until --docker asks for rootless.
+if [[ "${INSTALL_DOCKER:-}" == yes && -z "${DOCKER_MODE+x}" ]] && systemctl is-enabled --quiet docker 2>/dev/null; then
+  DOCKER_MODE=rootful
 fi
 
 # ----------------------------- Defaults --------------------------------------
@@ -104,6 +109,8 @@ AUTO_REBOOT="${AUTO_REBOOT:-yes}"               # reboot automatically when secu
 AUTO_REBOOT_TIME="${AUTO_REBOOT_TIME:-04:00}"
 
 INSTALL_DOCKER="${INSTALL_DOCKER:-no}"          # yes | no
+DOCKER_MODE="${DOCKER_MODE:-rootless}"          # rootless (daemon runs as DOCKER_USER, never root) | rootful (classic root daemon)
+DOCKER_USER="${DOCKER_USER:-}"                  # who runs rootless Docker; empty = the admin user. Created if missing
 ASSUME_YES="${ASSUME_YES:-no}"
 MODE=""                                         # "" (ask) | setup | verify
 
@@ -135,7 +142,10 @@ Options:
       --auto-reboot          Reboot automatically after updates (default)
       --no-auto-reboot       Never reboot automatically
       --reboot-time HH:MM    Time for automatic reboots           [04:00]
-      --docker               Install Docker + Compose
+      --docker               Install rootless Docker + Compose: the daemon
+                             runs as --docker-user, never as root
+      --docker-user NAME     User who runs Docker (created if missing) [admin]
+      --docker-rootful       Install the classic root Docker daemon instead
       --no-docker            Don't install Docker (default)
       --verify               Check an already set-up server (and offer fixes)
       --setup                Skip the menu and go straight to setup on re-runs
@@ -196,7 +206,9 @@ while [[ $# -gt 0 ]]; do
     --auto-reboot)        AUTO_REBOOT=yes; shift ;;
     --no-auto-reboot)     AUTO_REBOOT=no; shift ;;
     --reboot-time)        need_arg "$@"; AUTO_REBOOT_TIME="$2"; shift 2 ;;
-    --docker)             INSTALL_DOCKER=yes; shift ;;
+    --docker)             INSTALL_DOCKER=yes; DOCKER_MODE=rootless; shift ;;
+    --docker-rootful)     INSTALL_DOCKER=yes; DOCKER_MODE=rootful; shift ;;
+    --docker-user)        need_arg "$@"; DOCKER_USER="$2"; shift 2 ;;
     --no-docker)          INSTALL_DOCKER=no; shift ;;
     -c|--config)          need_arg "$@"
                           load_config "$2" || exit 1; shift 2 ;;
@@ -288,6 +300,7 @@ valid_swap()       { [[ "$1" =~ ^(auto|none|[0-9]+[MG])$ ]]; }
 valid_time()       { [[ "$1" =~ ^([01][0-9]|2[0-3]):[0-5][0-9]$ ]]; }
 valid_yesno()      { [[ "$1" == "yes" || "$1" == "no" ]]; }
 valid_forwarding() { [[ "$1" =~ ^(no|local|yes)$ ]]; }
+valid_docker_mode() { [[ "$1" =~ ^(rootless|rootful)$ ]]; }
 valid_sshkey() {
   [[ "$1" != *$'\n'* && "$1" != *$'\r'* ]] || return 1
   [[ "$1" =~ ^(ssh-(ed25519|rsa)|ecdsa-sha2-nistp[0-9]+|sk-[a-z0-9@.-]+)\ [A-Za-z0-9+/=]+ ]] || return 1
@@ -296,6 +309,65 @@ valid_sshkey() {
 }
 
 valid_password() { [[ "$1" != *$'\n'* && "$1" != *$'\r'* ]]; }
+
+# ----------------------------- Rootless Docker --------------------------------
+# The daemon runs as DOCKER_USER inside its own user namespace, so a container (or anyone
+# who can talk to the daemon) gets that user's rights and never root's. Nobody needs the
+# docker group. pasta keeps the visitor's source address on published ports, so a proxy or
+# fail2ban see real clients, and those ports are ordinary sockets that UFW filters.
+docker_group_members() { getent group docker 2>/dev/null | cut -d: -f4 | tr ',' '\n' | grep -vx root | grep . || true; }
+# next_subid_range FILE: the first 65536-wide range above every one listed in /etc/subuid or /etc/subgid
+next_subid_range() {
+  local start=100000 end
+  end="$(awk -F: '$2 ~ /^[0-9]+$/ && $3 ~ /^[0-9]+$/ { e = $2 + $3; if (e > m) m = e } END { print m + 0 }' "$1" 2>/dev/null || echo 0)"
+  (( end > start )) && start=$end || true
+  echo "$start-$((start + 65535))"
+}
+# rootless_docker_unit PATH: the systemd user unit that runs dockerd-rootless.sh at PATH
+rootless_docker_unit() {
+  cat <<EOF
+# Managed by serverbeef.sh
+[Unit]
+Description=Docker Application Container Engine (rootless, serverbeef)
+Documentation=https://docs.docker.com/go/rootless/
+
+[Service]
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+Environment=DOCKERD_ROOTLESS_ROOTLESSKIT_NET=pasta
+Environment=DOCKERD_ROOTLESS_ROOTLESSKIT_PORT_DRIVER=implicit
+ExecStart=$1
+ExecReload=/bin/kill -s HUP \$MAINPID
+TimeoutSec=0
+RestartSec=2
+Restart=always
+StartLimitBurst=3
+StartLimitInterval=60s
+LimitNOFILE=infinity
+LimitNPROC=infinity
+LimitCORE=infinity
+TasksMax=infinity
+Delegate=yes
+Type=notify
+NotifyAccess=all
+KillMode=mixed
+
+[Install]
+WantedBy=default.target
+Alias=docker.service
+EOF
+}
+# as_docker_user CMD...: run CMD as DOCKER_USER with what its systemd user instance and Docker need
+as_docker_user() {
+  local uid home
+  uid="$(id -u "$DOCKER_USER")"; home="$(getent passwd "$DOCKER_USER" | cut -d: -f6)"
+  runuser -u "$DOCKER_USER" -- env HOME="$home" USER="$DOCKER_USER" LOGNAME="$DOCKER_USER" \
+    XDG_RUNTIME_DIR="/run/user/$uid" DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$uid/bus" \
+    DOCKER_HOST="unix:///run/user/$uid/docker.sock" "$@"
+}
+# dockerctl ARGS...: the docker CLI against the daemon this server is configured for
+dockerctl() {
+  if [[ "$INSTALL_DOCKER" == yes && "$DOCKER_MODE" == rootless ]]; then as_docker_user docker "$@"; else docker "$@"; fi
+}
 
 # ----------------------------- Wizard ----------------------------------------
 # Prompts read from /dev/tty so `curl ... | sudo bash` still works.
@@ -456,6 +528,90 @@ automatic_updates_enabled() {
   ! grep -qx 'APT::Periodic::Enable "0";' <<< "$apt_settings"
 }
 
+# verify_docker_bindings rootless|rootful: list published ports and host networking per container
+verify_docker_bindings() {
+  local containers container details
+  if ! containers="$(dockerctl ps -q)"; then
+    vfail "Could not inspect Docker containers"; vhint "Check docker ps as the user who runs Docker"; return
+  fi
+  for container in $containers; do
+    if ! details="$(dockerctl inspect "$container" | jq -r '
+      .[] | .Name as $name |
+      (if .HostConfig.NetworkMode == "host" then "\($name): host networking" else empty end),
+      ((.NetworkSettings.Ports // {}) | to_entries[] | .value[]? |
+        select((.HostIp | startswith("127.")) == false and .HostIp != "::1") |
+        "\($name): \(.HostIp):\(.HostPort)")')"; then
+      vfail "Could not inspect a Docker network binding"; vhint "Review docker inspect $container"
+      continue
+    fi
+    [[ -n "$details" ]] || continue
+    if [[ "$1" == rootless ]]; then
+      vpass "Published ports (ordinary sockets, filtered by UFW):"
+    else
+      vwarn "Docker has non-loopback port bindings or host networking:"
+    fi
+    printf '        %s\n' "$details"
+    [[ "$1" == rootless ]] || vhint "Check provider firewall and container networks; use localhost bindings for internal services"
+  done
+  [[ "$1" == rootless ]] || vhint "Published ports can bypass UFW. Also review routed, macvlan and ipvlan networks."
+}
+verify_rootless_docker() {
+  local members uid environment
+  if systemctl is-active --quiet docker; then
+    vfail "The root Docker daemon is running: whoever can use it is root"
+    vhint "Fix: sudo systemctl disable --now docker.service docker.socket && sudo systemctl mask docker.service docker.socket"
+  else vpass "No root Docker daemon"
+  fi
+  members="$(docker_group_members | xargs)"
+  if [[ -n "$members" ]]; then
+    vwarn "In the docker group (root-equivalent if a root daemon ever runs): $members"; vhint "Fix: sudo gpasswd -d <user> docker"
+  else vpass "Nobody is in the docker group"
+  fi
+  if (( $(sysctl -n net.ipv4.ip_unprivileged_port_start 2>/dev/null || echo 1024) <= 80 )); then
+    vpass "Unprivileged daemons may publish ports 80 and 443"
+  else vwarn "Rootless Docker cannot publish ports below $(sysctl -n net.ipv4.ip_unprivileged_port_start 2>/dev/null)"; vhint "Fix: re-run setup with --docker"
+  fi
+  if grep -qw rootlesskit /sys/kernel/security/apparmor/profiles 2>/dev/null; then vpass "AppArmor allows rootlesskit to use user namespaces"
+  else vwarn "AppArmor profile for rootlesskit is not loaded"; vhint "Fix: sudo apparmor_parser -r /etc/apparmor.d/rootlesskit"
+  fi
+  if ! id "$DOCKER_USER" &>/dev/null; then
+    vfail "Docker user $DOCKER_USER does not exist"; vhint "Re-run setup with --docker --docker-user $DOCKER_USER"; return
+  fi
+  if [[ "$DOCKER_USER" != "$ADMIN_USER" ]] && sudo -l -U "$DOCKER_USER" 2>/dev/null | grep -q '(ALL'; then
+    vwarn "$DOCKER_USER has sudo rights; a deploy user should have none"; vhint "Review sudo -l -U $DOCKER_USER"
+  fi
+  uid="$(id -u "$DOCKER_USER")"
+  if [[ "$(loginctl show-user "$DOCKER_USER" -p Linger --value 2>/dev/null)" == yes ]]; then vpass "$DOCKER_USER's daemon starts at boot (linger)"
+  else vfail "$DOCKER_USER's daemon will not start at boot"; vhint "Fix: sudo loginctl enable-linger $DOCKER_USER"
+  fi
+  if [[ -S "/run/user/$uid/docker.sock" ]] && as_docker_user docker info --format '{{.SecurityOptions}}' 2>/dev/null | grep -q rootless; then
+    vpass "Rootless Docker runs as $DOCKER_USER"
+    environment="$(as_docker_user systemctl --user show -p Environment --value "${MARK}-docker.service" 2>/dev/null)"
+    if [[ "$environment" == *DOCKERD_ROOTLESS_ROOTLESSKIT_NET=pasta* ]]; then vpass "Published ports keep the visitor's source address (pasta)"
+    else vwarn "Rootless Docker is not using pasta: published ports show an internal source address"; vhint "Fix: re-run setup with --docker"
+    fi
+    verify_docker_bindings rootless
+  else
+    vfail "Rootless Docker is not running for $DOCKER_USER"; vhint "Check: sudo -iu $DOCKER_USER systemctl --user status ${MARK}-docker"
+  fi
+}
+verify_rootful_docker() {
+  local members
+  if systemctl is-active --quiet docker; then
+    vpass "Docker is running"
+    members="$(docker_group_members | xargs)"
+    if [[ -n "$members" && "$ADMIN_SUDO_NOPASSWD" != yes ]]; then
+      vfail "In the docker group, which is root without a password: $members"; vhint "Fix: sudo gpasswd -d <user> docker, or re-run setup with --docker for rootless Docker"
+    elif [[ -n "$members" ]]; then
+      vhint "Root-equivalent docker group: $members (same as their passwordless sudo; --docker gives rootless Docker)"
+    fi
+    verify_docker_bindings rootful
+  elif [[ "$INSTALL_DOCKER" == yes ]]; then
+    vfail "Docker is NOT running"; vhint "Check sudo systemctl status docker"
+  else
+    vpass "Docker is installed but inactive"
+  fi
+}
 run_verify() {
   local user_home keys sshd_cfg p rule token port
   echo
@@ -643,40 +799,16 @@ run_verify() {
   else vwarn "Clock is not synced yet"; vhint "Check timedatectl"
   fi
 
-  if command -v docker >/dev/null; then
-    section "Docker"
-    if systemctl is-active --quiet docker; then
-      vpass "Docker is running"
-      local containers container details
-      if ! containers="$(docker ps -q)"; then
-        vfail "Could not inspect Docker containers"; vhint "Check sudo docker ps"
-      else
-        for container in $containers; do
-          if ! details="$(docker inspect "$container" | jq -r '
-            .[] | .Name as $name |
-            (if .HostConfig.NetworkMode == "host" then "\($name): host networking" else empty end),
-            ((.NetworkSettings.Ports // {}) | to_entries[] | .value[]? |
-              select((.HostIp | startswith("127.")) == false and .HostIp != "::1") |
-              "\($name): \(.HostIp):\(.HostPort)")')"; then
-            vfail "Could not inspect a Docker network binding"; vhint "Review sudo docker inspect $container"
-            continue
-          fi
-          if [[ -n "$details" ]]; then
-            vwarn "Docker has non-loopback port bindings or host networking:"
-            printf '        %s\n' "$details"
-            vhint "Check provider firewall and container networks; use localhost bindings for internal services"
-          fi
-        done
-        vhint "Published ports can bypass UFW. Also review routed, macvlan and ipvlan networks."
-      fi
-    else
-      if [[ "$INSTALL_DOCKER" == yes ]]; then
-        vfail "Docker is NOT running"; vhint "Check sudo systemctl status docker"
-      else
-        vpass "Docker is installed but inactive"
-      fi
+  if [[ "$INSTALL_DOCKER" == yes && "$DOCKER_MODE" == rootless ]]; then
+    section "Docker (rootless)"
+    if command -v docker >/dev/null; then verify_rootless_docker
+    else vfail "Docker is configured but not installed"; vhint "Re-run setup with --docker"
     fi
+  elif command -v docker >/dev/null; then
+    section "Docker"
+    verify_rootful_docker
   elif [[ "$INSTALL_DOCKER" == yes ]]; then
+    section "Docker"
     vfail "Docker is configured but not installed"; vhint "Re-run setup with --docker"
   fi
 
@@ -860,6 +992,13 @@ EOF
 
   section "Extras"
   ask_yn INSTALL_DOCKER "Install Docker + Docker Compose?"
+  if [[ "$INSTALL_DOCKER" == "yes" ]]; then
+    ask DOCKER_MODE "Docker mode (rootless/rootful)" valid_docker_mode "rootless: the daemon runs as a normal user and containers can never reach root. rootful: the classic root daemon; whoever may use it is root."
+    if [[ "$DOCKER_MODE" == "rootless" ]]; then
+      [[ -n "$DOCKER_USER" ]] || DOCKER_USER="$ADMIN_USER"
+      ask DOCKER_USER "User who runs Docker" valid_user "Created if missing. Use a separate user (e.g. deploy) when agents or CI deploy without sudo."
+    fi
+  fi
 fi
 
 # Values equal to the current state mean "leave unchanged"
@@ -873,6 +1012,7 @@ FIREWALL_TCP_PORTS="$(none_to_empty "$FIREWALL_TCP_PORTS")"
 FIREWALL_UDP_PORTS="$(none_to_empty "$FIREWALL_UDP_PORTS")"
 for v in COPY_ROOT_KEYS AUTO_REBOOT INSTALL_DOCKER; do printf -v "$v" '%s' "$(yesno "${!v}")"; done
 [[ "$ADMIN_SUDO_NOPASSWD" == "auto" ]] || ADMIN_SUDO_NOPASSWD="$(yesno "$ADMIN_SUDO_NOPASSWD")"
+[[ -n "$DOCKER_USER" ]] || DOCKER_USER="$ADMIN_USER"
 
 valid_user "$ADMIN_USER"                      || die "Invalid admin user: $ADMIN_USER"
 valid_port "$SSH_PORT"                        || die "Invalid SSH port: $SSH_PORT"
@@ -884,6 +1024,8 @@ valid_timezone "$TIMEZONE"                    || die "Unknown timezone: $TIMEZON
 valid_swap "$SWAP_SIZE"                       || die "Invalid swap size: $SWAP_SIZE"
 valid_time "$AUTO_REBOOT_TIME"                || die "Invalid reboot time: $AUTO_REBOOT_TIME"
 valid_password "$ADMIN_PASSWORD"              || die "Passwords must not contain line breaks"
+valid_docker_mode "$DOCKER_MODE"              || die "Invalid Docker mode: $DOCKER_MODE (rootless or rootful)"
+valid_user "$DOCKER_USER"                     || die "Invalid Docker user: $DOCKER_USER"
 [[ "$ADMIN_SUDO_NOPASSWD" =~ ^(yes|no|auto)$ ]] || die "Invalid ADMIN_SUDO_NOPASSWD: $ADMIN_SUDO_NOPASSWD"
 for v in COPY_ROOT_KEYS AUTO_REBOOT INSTALL_DOCKER; do valid_yesno "${!v}" || die "$v must be yes or no"; done
 while IFS= read -r k; do
@@ -912,6 +1054,10 @@ else
   key_summary="none → password login stays ON"
   [[ "$ADMIN_SUDO_NOPASSWD" == "auto" ]] && ADMIN_SUDO_NOPASSWD=no || true
 fi
+docker_summary="$INSTALL_DOCKER"
+if [[ "$INSTALL_DOCKER" == yes ]]; then
+  [[ "$DOCKER_MODE" == rootless ]] && docker_summary+=" (rootless, run by $DOCKER_USER)" || docker_summary+=" (rootful: a root daemon)"
+fi
 cat <<EOF
 
 ${C_BLUE}serverbeef — about to configure this server:${C_RESET}
@@ -925,7 +1071,7 @@ ${C_BLUE}serverbeef — about to configure this server:${C_RESET}
   Timezone .............. ${TIMEZONE:-(unchanged)}
   Swap .................. $SWAP_SIZE
   Auto reboot ........... $AUTO_REBOOT$([[ "$AUTO_REBOOT" == yes ]] && echo " ($AUTO_REBOOT_TIME)")
-  Install Docker ........ $INSTALL_DOCKER
+  Install Docker ........ $docker_summary
 
 EOF
 if [[ "$INTERACTIVE" == "yes" ]]; then
@@ -1457,7 +1603,64 @@ ok "Core dumps off, su restricted, unused kernel modules blocked"
 # ============================================================================
 step "11/11 Optional: Docker"
 # ============================================================================
-if [[ "$INSTALL_DOCKER" == "yes" ]]; then
+if [[ "$INSTALL_DOCKER" == "yes" && "$DOCKER_MODE" == "rootless" ]]; then
+  # Rootless: the daemon runs as DOCKER_USER in a user namespace. Nobody is in the docker
+  # group, so Docker never hands out root. Published ports are plain sockets: UFW applies.
+  if systemctl is-active --quiet docker && [[ -n "$(docker ps -q 2>/dev/null)" ]]; then
+    die "The root Docker daemon still runs containers. Stop them (their data stays in /var/lib/docker) and re-run, or keep that daemon with --docker-rootful."
+  fi
+  apt-get "${APT_OPTS[@]}" install docker.io docker-compose-v2 docker-buildx rootlesskit uidmap passt slirp4netns dbus-user-session
+  ROOTLESS_SH="$(command -v dockerd-rootless.sh || true)"
+  [[ -n "$ROOTLESS_SH" ]] || ROOTLESS_SH=/usr/share/docker.io/contrib/dockerd-rootless.sh
+  [[ -x "$ROOTLESS_SH" ]] || die "dockerd-rootless.sh not found: this Docker package has no rootless support"
+  systemctl disable --now docker.service docker.socket >/dev/null 2>&1 || true
+  systemctl mask docker.service docker.socket >/dev/null 2>&1 || true
+  for u in "$ADMIN_USER" "$DOCKER_USER"; do
+    if id -nG "$u" 2>/dev/null | tr ' ' '\n' | grep -qx docker; then gpasswd -d "$u" docker >/dev/null; fi
+  done
+  if [[ -n "$(docker_group_members)" ]]; then
+    warn "Still in the docker group (root-equivalent if a root daemon ever runs): $(docker_group_members | xargs). Remove with: gpasswd -d <user> docker"
+  fi
+  cat > "/etc/sysctl.d/90-${MARK}-rootless-docker.conf" <<'EOF'
+# Managed by serverbeef.sh: let rootless Docker publish ports 80 and 443.
+net.ipv4.ip_unprivileged_port_start = 80
+EOF
+  sysctl -q -p "/etc/sysctl.d/90-${MARK}-rootless-docker.conf"
+  if ! id "$DOCKER_USER" &>/dev/null; then
+    adduser --disabled-password --gecos "" "$DOCKER_USER" >/dev/null
+    ok "User $DOCKER_USER created: no password, no sudo. Add SSH keys to its authorized_keys to let it log in"
+  fi
+  usermod -aG ssh-users "$DOCKER_USER"
+  grep -q "^$DOCKER_USER:" /etc/subuid || usermod --add-subuids "$(next_subid_range /etc/subuid)" "$DOCKER_USER"
+  grep -q "^$DOCKER_USER:" /etc/subgid || usermod --add-subgids "$(next_subid_range /etc/subgid)" "$DOCKER_USER"
+  loginctl enable-linger "$DOCKER_USER"
+  docker_uid="$(id -u "$DOCKER_USER")"
+  docker_home="$(getent passwd "$DOCKER_USER" | cut -d: -f6)"
+  for _ in $(seq 1 30); do [[ -S "/run/user/$docker_uid/bus" ]] && break; sleep 1; done
+  [[ -S "/run/user/$docker_uid/bus" ]] || die "The systemd user instance for $DOCKER_USER did not start. Check: loginctl user-status $DOCKER_USER"
+  as_docker_user install -d -m 700 "$docker_home/.config/docker" "$docker_home/.config/systemd/user"
+  if [[ ! -f "$docker_home/.config/docker/daemon.json" ]]; then
+    as_docker_user tee "$docker_home/.config/docker/daemon.json" >/dev/null <<'EOF'
+{
+  "log-driver": "local",
+  "log-opts": { "max-size": "20m", "max-file": "5" }
+}
+EOF
+  fi
+  rootless_docker_unit "$ROOTLESS_SH" | as_docker_user tee "$docker_home/.config/systemd/user/${MARK}-docker.service" >/dev/null
+  as_docker_user systemctl --user daemon-reload
+  as_docker_user systemctl --user enable "${MARK}-docker.service" >/dev/null 2>&1 || true
+  as_docker_user systemctl --user restart "${MARK}-docker.service"
+  for _ in $(seq 1 30); do [[ -S "/run/user/$docker_uid/docker.sock" ]] && break; sleep 1; done
+  if ! as_docker_user docker info --format '{{.SecurityOptions}}' 2>/dev/null | grep -q rootless; then
+    die "Rootless Docker did not start for $DOCKER_USER. Check: sudo -iu $DOCKER_USER systemctl --user status ${MARK}-docker"
+  fi
+  as_docker_user docker context inspect rootless >/dev/null 2>&1 \
+    || as_docker_user docker context create rootless --docker "host=unix:///run/user/$docker_uid/docker.sock" >/dev/null
+  as_docker_user docker context use rootless >/dev/null
+  ok "Rootless Docker $(as_docker_user docker version --format '{{.Server.Version}}') runs as $DOCKER_USER; the root daemon is off and nobody is in the docker group"
+  [[ "$DOCKER_USER" == "$ADMIN_USER" ]] || ok "Use it as $DOCKER_USER: log in as that user, or sudo -iu $DOCKER_USER"
+elif [[ "$INSTALL_DOCKER" == "yes" ]]; then
   apt-get "${APT_OPTS[@]}" install docker.io docker-compose-v2 docker-buildx
   mkdir -p /etc/docker
   if [[ ! -f /etc/docker/daemon.json ]]; then
@@ -1469,10 +1672,20 @@ if [[ "$INSTALL_DOCKER" == "yes" ]]; then
 }
 EOF
   fi
+  systemctl unmask docker.service docker.socket >/dev/null 2>&1 || true
   systemctl enable --now docker >/dev/null 2>&1
   systemctl restart docker
-  usermod -aG docker "$ADMIN_USER"
-  ok "Docker $(docker --version | awk '{print $3}' | tr -d ,) installed; $ADMIN_USER added to docker group"
+  if [[ "$ADMIN_SUDO_NOPASSWD" == "yes" ]]; then
+    # The docker group is root-equivalent; that only matches an admin who already has passwordless sudo.
+    usermod -aG docker "$ADMIN_USER"
+    ok "Docker $(docker --version | awk '{print $3}' | tr -d ,) installed; $ADMIN_USER added to docker group"
+  else
+    if id -nG "$ADMIN_USER" | tr ' ' '\n' | grep -qx docker; then gpasswd -d "$ADMIN_USER" docker >/dev/null; fi
+    ok "Docker $(docker --version | awk '{print $3}' | tr -d ,) installed; use it with sudo (the docker group would be root without a password)"
+  fi
+  if [[ -n "$(docker_group_members)" ]]; then
+    warn "Root-equivalent docker group members: $(docker_group_members | xargs)"
+  fi
   warn "Docker-published ports BYPASS UFW. Bind internal services to localhost, e.g. -p 127.0.0.1:5432:5432"
 else
   ok "Skipped (set INSTALL_DOCKER=yes to install)"
@@ -1532,6 +1745,7 @@ cat <<EOF
      sudo unattended-upgrade --dry-run --debug
 
  Add a public port later:  sudo ufw allow 8080/tcp
+$([[ "$INSTALL_DOCKER" == yes && "$DOCKER_MODE" == rootless ]] && echo " Docker runs rootless as $DOCKER_USER: use it from that account (log in as $DOCKER_USER, or sudo -iu $DOCKER_USER).")
 EOF
 if (( ${#WARNINGS[@]} )); then
   echo

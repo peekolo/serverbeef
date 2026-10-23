@@ -8,11 +8,14 @@ provider credentials and local configuration files out of the repository and its
 
 - Run only reviewed code as root. Downloading from a moving branch trusts every future change to that branch;
   for repeatable deployments, review and pin a full commit SHA and retain the reviewed file's checksum.
-- Protect the admin SSH key. Passwordless sudo and Docker group membership both provide root-equivalent
-  access. Keep application deployment accounts separate from the admin account.
+- Protect the admin SSH key. Passwordless sudo is root. The `docker` group of a root daemon is root too, which
+  is why the default is rootless Docker run by a user of your choice; keep that deployment account separate
+  from the admin account and give it no sudo.
 - A custom SSH port is discoverable. Authentication, patching and network policy provide protection.
-- Docker-published ports can bypass UFW. Review host bindings, container networks, IPv4 and IPv6, and the
-  provider firewall. A green UFW status alone is insufficient.
+- Ports published by a root Docker daemon bypass UFW. Rootless Docker's published ports are ordinary sockets
+  that UFW filters, but a container is only as isolated as user namespaces make it: a kernel bug in that
+  isolation is the remaining path from a container to the host. Review host bindings, container networks,
+  IPv4 and IPv6, and the provider firewall either way.
 - Cloudflare protects requests routed through it. Separately restrict origin access and verify that internal
   databases and application services cannot be reached directly.
 - Application authorization, dependencies, secrets, database permissions, backups and recovery require their
@@ -52,8 +55,8 @@ Do not enable shell tracing around secret handling.
 Run `bash -n serverbeef.sh`, `shellcheck serverbeef.sh`, and
 `python3 -m unittest discover -s tests -v`. The regression suite extracts individual helpers and never runs
 host setup. It covers literal config loading, key restrictions and validation, password line-break rejection,
-port validation, random port range, unsafe key-file links, key append idempotence, effective SSH policy checks
-and rollback.
+port validation, random port range, unsafe key-file links, key append idempotence, effective SSH policy checks,
+rollback, and the rootless Docker unit, docker group and subordinate id helpers.
 
 Before release, run the complete script twice on a disposable Ubuntu 26.04 VM, compare managed configuration,
 test a new SSH connection and sudo, and run `--verify`. Include IPv6, socket-activated SSH, existing SSH overrides,

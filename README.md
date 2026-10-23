@@ -59,7 +59,9 @@ of them. Answer these ones yourself:
   this account from now on, because logging in as root gets turned off.
 - When it asks for a public key, paste the line you copied in step 1. Only copy keys from root if you recognize
   them as your personal admin keys. Restricted root keys are skipped; their restrictions are never stripped.
-- If your app runs in Docker, answer yes to the Docker question.
+- If your app runs in Docker, answer yes to the Docker question and keep the rootless mode: the Docker daemon
+  then runs as a normal user, so nothing inside a container can reach root. If an AI assistant or CI will do
+  the deployments, give Docker its own user (`deploy`) instead of your admin account.
 
 Before it changes anything, it shows a summary and asks you to confirm. Find the SSH port there (a number
 like `4821`) and write it down: from now on you log in on that port. At the end it prints the exact login command.
@@ -135,7 +137,7 @@ pipe anything from the internet into a root shell.
 | 8. Kernel, network | BBR and fq, larger queues and buffers, SYN cookies, no redirects or source routing, restricted kernel pointers, dmesg, ptrace and unprivileged BPF |
 | 9. Swap, limits, logs | A swap file sized to RAM (1 to 4 GB) if there is none, higher open-file limits, journald capped at 1 GB and one month |
 | 10. Misc | Core dumps off, `su` limited to the sudo group, home folders private, unused protocols and filesystems blocked, Ctrl-Alt-Del from the provider console ignored |
-| 11. Docker (optional) | Docker and Compose from Ubuntu's packages, log rotation, `live-restore`, admin in the `docker` group |
+| 11. Docker (optional) | Rootless Docker and Compose from Ubuntu's packages: the daemon runs as the Docker user (the admin, or `--docker-user deploy`, created if missing), the root daemon is off and masked, nobody is in the `docker` group, ports 80 and 443 can be published without root, pasta keeps the visitor's source address, log rotation. `--docker-rootful` installs the classic root daemon instead |
 
 Managed drop-ins have `serverbeef` in their name (`/etc/ssh/sshd_config.d/00-serverbeef.conf`,
 `/etc/sysctl.d/90-serverbeef.conf` and so on), so you can see what came from the script. A few shared files, such
@@ -158,7 +160,9 @@ saved in `/etc/serverbeef/state.conf` (never passwords or keys), and the script 
 | `--hostname NAME`, `--timezone TZ` | unchanged | |
 | `--swap auto\|none\|2G` | `auto` | Swap file size |
 | `--auto-reboot` / `--no-auto-reboot`, `--reboot-time HH:MM` | on, `04:00` | Reboots after updates |
-| `--docker` / `--no-docker` | off | Install Docker and Compose |
+| `--docker` / `--no-docker` | off | Install rootless Docker and Compose |
+| `--docker-user NAME` | the admin | User who runs rootless Docker (created if missing) |
+| `--docker-rootful` | | The classic root daemon instead of rootless Docker |
 | `--verify` | | Check a server this script already set up |
 | `--setup` | | On a re-run, skip the menu and run setup again |
 | `-c, --config FILE` | | Load settings from a file of `VAR=value` lines |
@@ -179,9 +183,11 @@ Keep config files with passwords private (`chmod 600`) and out of version contro
 on the right port and is key-only, the admin exists with sudo and keys, UFW is active with the ports you chose,
 fail2ban jails are running, updates are on, BBR, swap, AppArmor and the clock are fine. It also lists other
 accounts that can log in with a password or have sudo rights, such as the `linuxuser` or `ubuntu` account some
-provider images leave behind, and prints the command to lock or remove them. It inspects Docker even
-when Docker was installed separately, reporting non-loopback published ports and host networking. Routed,
-macvlan and ipvlan networks still need a separate review. It offers to delete firewall rules that are not in your settings (such as the
+provider images leave behind, and prints the command to lock or remove them. With rootless Docker it checks
+that the root daemon is off, nobody is in the `docker` group, the Docker user's daemon runs and starts at
+boot, and published ports keep source addresses. A root daemon, even one installed separately, gets its
+non-loopback published ports and host networking listed. Routed, macvlan and ipvlan networks still need a
+separate review. It offers to delete firewall rules that are not in your settings (such as the
 old port 22), then runs a quick Lynis audit and prints the score and warnings.
 SSH policy is checked globally and in sampled connection contexts; arbitrary `Match` rules require manual
 review. Missing validated admin keys and detected policy failures make verification exit nonzero. Warnings
@@ -189,9 +195,13 @@ still require review even when the exit code is zero.
 
 ## Things to know
 
-- Docker-published ports bypass UFW. Docker writes its own iptables rules, so `-p 5432:5432` is open to the
-  internet whatever UFW says. Bind internal services to localhost (`-p 127.0.0.1:5432:5432`), put a firewall at your
-  provider in front of the server, or both. The script warns about this and the verify mode lists exposed ports.
+- Rootless Docker (the default) publishes ports as ordinary sockets, so UFW filters them like any other port and
+  the daemon has no root to give away. A root daemon (`--docker-rootful`) writes its own iptables rules, so
+  `-p 5432:5432` is open to the internet whatever UFW says: bind internal services to localhost
+  (`-p 127.0.0.1:5432:5432`), put a firewall at your provider in front of the server, or both. The script warns
+  about this and the verify mode lists exposed ports.
+- Rootless Docker runs as one user. Use it from that account (`ssh deploy@...`, or `sudo -iu deploy`); `sudo docker`
+  talks to a root daemon that is not there. Each user who should run containers needs their own daemon.
 - If your provider has a firewall in front of the server, choose the SSH port before you run the script
   (`--ssh-port 4821`, or let the wizard pick one and note it) and allow it there, or you can't log in on it.
 - Port 22 stays open in UFW until you remove it. If your provider added a rule for port 22, the script prints the
@@ -201,8 +211,9 @@ still require review even when the exit code is zero.
   otherwise. Restricted keys already in the account remain untouched but do not qualify as an admin login.
   Add an unrestricted personal key and run the script again.
 - With a key, sudo needs no password by default, so whoever holds that key is root. Use `--sudo-password` if you
-  want sudo to require a password. This is not SSH multifactor authentication; membership in the Docker group
-  also grants root-equivalent access and bypasses that sudo password boundary.
+  want sudo to require a password. This is not SSH multifactor authentication. The `docker` group of a root
+  daemon is root without a password, so with `--sudo-password` the admin is kept out of it; rootless Docker,
+  the default, has no such group.
 - Passwordless admins receive sudo permission directly and use `ssh-users` for SSH. They are removed from
   the `sudo` group because its additional password-required rule makes `sudo -v` prompt on Ubuntu 26.04.
   Use `sudo -i` for a root shell. Password-required admins remain in the `sudo` group. Test from a fresh SSH
