@@ -128,15 +128,14 @@ mkdir -p "$SSH_DIR"; chmod 700 "$SSH_DIR"; touch "$SSH_CONFIG"; chmod 600 "$SSH_
 cat <<EOF
 
 ${B}serverbeef-local: prepare your computer for a new server${N}
-  Three short parts: (1) how to reach the server today, (2) what it should become (name, admin, port), (3) keys.
+  Four short parts: (1) which server, (2) how to reach it today, (3) what it should become (name, admin, port), (4) keys.
   It then makes two SSH keys and two ssh aliases, and uploads serverbeef.sh with your answers to the server.
   The admin key gets a passphrase: it is the key that can become root. The deploy key is for CI and AI agents and
   gets none: that account can never reach root. Private keys stay on this computer. Nothing on the server changes
   until you run serverbeef.sh there.
 EOF
 
-section "1. The server as it is now"
-echo "    How to reach it today, before serverbeef runs."
+section "1. Which server"
 ask IP "Server IP address" "" valid_ip "From your provider's dashboard."
 
 declare -a SET_ASIDE=() BLOCKS=()
@@ -174,6 +173,8 @@ elif [[ "$MODE" == reset ]]; then
   echo "    At the end, after you confirm: these entries leave ~/.ssh/config (a backup is kept), the old host key of"
   echo "    $IP is forgotten, and keys no other entry uses are set aside, not deleted. Ctrl-C before that changes nothing."
 fi
+section "2. How to reach it today"
+echo "    The login your provider gave you, before serverbeef runs."
 # how the upload and the setup command reach the box
 NOW_USER='' NOW_PORT='' NOW_ALIAS=''
 if [[ -n "$admin_alias" ]]; then
@@ -185,7 +186,7 @@ else
   ask NOW_PORT "SSH port today" 22 valid_any_port
 fi
 
-section "2. The server after serverbeef"
+section "3. What it should become"
 echo "    What you want it to be. The ssh aliases on this computer and the setup's defaults come from these."
 if valid_name "${NAME:-${admin_alias:-${deploy_alias%_deploy}}}"; then NAME="${admin_alias:-${deploy_alias%_deploy}}"; ok "name: $NAME"
 else ask NAME "Friendly name for this server" "" valid_name "Short, lowercase: it becomes the ssh alias (ssh <name>, ssh <name>_deploy)."; fi
@@ -198,7 +199,7 @@ else ask PORT "SSH port for this server" "$(shuf -i 1025-9999 -n 1)" valid_port 
 WORK="$(mktemp -d)"; chmod 700 "$WORK"; trap 'rm -rf "$WORK"' EXIT
 declare -a NEW_KEYS=()
 
-section "3. Keys"
+section "4. Keys"
 [[ -z "$ADMIN_KEY" ]] || ok "admin key kept: $ADMIN_KEY"
 [[ -z "$DEPLOY_KEY" ]] || ok "deploy key kept: $DEPLOY_KEY"
 if [[ -z "$ADMIN_KEY" ]]; then

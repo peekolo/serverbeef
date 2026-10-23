@@ -24,8 +24,9 @@ curl -fsSLO https://raw.githubusercontent.com/peekolo/serverbeef/HEAD/serverbeef
 bash serverbeef-local.sh
 ```
 
-It asks three short sets of questions: how you reach the server today (its IP address, the user and port your
-provider gave you, usually `root` on port 22); what it should become (a short name such as `box1`, the admin
+It asks four short sets of questions: which server (its IP address, and whether to reuse or reset what this
+computer already has for it); how you reach it today (the user and port your provider gave you, usually `root`
+on port 22); what it should become (a short name such as `box1`, the admin
 username you want on it, where your first name in lowercase works and `root` and `deploy` are not allowed, and a
 random SSH port it offers); and a passphrase. It shows what it is about to do and waits for a yes. Then it:
 
