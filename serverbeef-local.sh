@@ -51,7 +51,7 @@ valid_name()  { [[ "$1" =~ ^[a-z0-9][a-z0-9_-]{0,31}$ && "$1" != *_deploy ]]; }
 valid_admin() { [[ "$1" =~ ^[a-z_][a-z0-9_-]{0,31}$ && "$1" != root && "$1" != deploy ]]; }
 valid_port()  { [[ "$1" =~ ^[1-9][0-9]{0,4}$ ]] && (( 10#$1 >= 1025 && 10#$1 <= 65535 )); }
 valid_role()  { [[ "$1" == admin || "$1" == deploy ]]; }
-valid_mode()  { [[ "$1" == reuse || "$1" == reset ]]; }
+valid_mode()  { [[ "${1,,}" =~ ^(u|reuse|s|reset)$ ]]; }
 always_ok()   { true; }
 expand_tilde() { printf '%s' "${1/#\~/$HOME}"; }
 
@@ -145,8 +145,9 @@ if (( ${#BLOCKS[@]} > 0 )); then
     printf '      ssh %-20s user %-12s port %-6s key %s%s\n' "$alias" "${user:-?}" "${port:-22}" "${idf:-none}" \
       "$([[ -n "$idf" && ! -f "$(expand_tilde "$idf")" ]] && echo " (missing!)")"
   done
-  ask MODE "Reuse these entries and keys, or reset (you reinstalled the server)?" reuse valid_mode \
-    "reuse: keep what exists, make only what is missing. reset: remove these entries, forget the old host key, make new keys."
+  ask MODE "re[u]se them, or re[s]et because you reinstalled the server? (u/s)" u valid_mode \
+    "u = reuse: keep what exists, make only what is missing.  s = reset: remove these entries, forget the old host key, make new keys."
+  case "${MODE,,}" in u|reuse) MODE=reuse ;; *) MODE=reset ;; esac
 fi
 
 NAME='' ADMIN='' PORT='' ADMIN_KEY='' DEPLOY_KEY='' UPLOAD_VIA=root
