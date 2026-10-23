@@ -21,9 +21,9 @@ root on the server. This file covers running it for someone and changing it.
 5. **Use verify mode to check a server**: `sudo serverbeef --verify`. It only changes something (deleting leftover
    firewall rules) after a yes. In a non-interactive shell, a re-run with no mode flag runs setup again, so pass
    `--verify` explicitly.
-6. **Never print, log or commit a generated password.** The script writes it to the terminal only, or to
-   `/root/serverbeef-<user>-password.txt` (mode 600) when there is no terminal. Tell the owner where it is; don't
-   read it out.
+6. **Never print, log or commit a generated password.** sudo asks for a password by default, and an unattended run
+   generates one. The script writes it to the terminal only, or to `/root/serverbeef-<user>-password.txt`
+   (mode 600) when there is no terminal. Tell the owner where it is; don't read it out.
 
 Unattended run:
 

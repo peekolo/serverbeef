@@ -91,7 +91,7 @@ fi
 ADMIN_USER="${ADMIN_USER:-deploy}"              # sudo user to create/configure
 ADMIN_SSH_KEY="${ADMIN_SSH_KEY:-}"              # public key(s), one per line
 ADMIN_PASSWORD="${ADMIN_PASSWORD:-}"            # sudo password (prefer the wizard over this)
-ADMIN_SUDO_NOPASSWD="${ADMIN_SUDO_NOPASSWD:-auto}" # yes | no | auto (yes if the user has an SSH key)
+ADMIN_SUDO_NOPASSWD="${ADMIN_SUDO_NOPASSWD:-no}"  # no (sudo asks for a password) | yes | auto (yes if the user has an SSH key)
 GENERATE_PASSWORD="${GENERATE_PASSWORD:-no}"    # set by the wizard when you accept [auto-generate]
 COPY_ROOT_KEYS="${COPY_ROOT_KEYS:-yes}"         # copy root's authorized_keys to the admin user
 
@@ -130,8 +130,8 @@ Options:
   -u, --user NAME            Admin (sudo) user to create          [deploy]
   -k, --ssh-key "KEY"        Public SSH key for the admin user (repeatable)
       --no-copy-root-keys    Don't copy root's authorized_keys to the admin user
-      --sudo-nopasswd        Passwordless sudo (default if a key is installed)
-      --sudo-password        Require a password for sudo (generated if none set)
+      --sudo-nopasswd        Passwordless sudo: whoever holds the SSH key is root
+      --sudo-password        sudo asks for a password (generated if none set) [default]
   -p, --ssh-port PORT        SSH port, or "random"                [random]
       --forwarding MODE      SSH TCP forwarding: no|local|yes     [local]
       --tcp-ports "P ..."    Public TCP ports (besides SSH)       ["80 443"]
@@ -946,6 +946,7 @@ EOF
   section "sudo"
   if [[ "$WIZ_HAS_KEY" == "yes" ]]; then
     [[ "$ADMIN_SUDO_NOPASSWD" == "auto" ]] && ADMIN_SUDO_NOPASSWD=yes || true
+    echo "    With a password, root stays behind something only you know; a deploy key or an agent cannot get it."
     ask_yn ADMIN_SUDO_NOPASSWD "Passwordless sudo for $ADMIN_USER?"
   else
     echo "    No SSH key, so $ADMIN_USER logs in with a password — sudo will use that password too."

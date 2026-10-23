@@ -129,7 +129,7 @@ pipe anything from the internet into a root shell.
 |---|---|
 | 1. Packages | Full upgrade, then common tools (curl, jq, git, htop, tmux, vim, dnsutils...), ufw, fail2ban, unattended-upgrades, chrony, AppArmor, Lynis. `needrestart` restarts services without asking |
 | 2. Hostname, time | Optional hostname and timezone; time sync with chrony |
-| 3. Admin user | Creates the sudo user, installs your public key(s) and optionally copies unrestricted, validated root keys. Passwordless sudo when a key is installed, otherwise a password (generated if needed, delivered privately to the terminal or a root-only file and never written to the log) |
+| 3. Admin user | Creates the sudo user, installs your public key(s) and optionally copies unrestricted, validated root keys. sudo asks for a password (generated if needed, delivered privately to the terminal or a root-only file and never written to the log); `--sudo-nopasswd` for passwordless sudo |
 | 4. SSH | A port of its own for each server (random unless you choose one), key-only login, no root login, only the `sudo` and `ssh-users` groups may log in, agent/X11 forwarding off, `ssh -L` tunnels allowed by default. The config is tested with `sshd -t` before it is used |
 | 5. Firewall | UFW denies incoming by default; SSH (rate limited), 80/tcp, 443/tcp and 443/udp are open. `--tcp-ports` and `--udp-ports` change the list |
 | 6. Fail2ban | SSH jail in aggressive mode, bans that get longer for repeat offenders, and a recidive jail (one week) |
@@ -152,7 +152,7 @@ saved in `/etc/serverbeef/state.conf` (never passwords or keys), and the script 
 | `-u, --user NAME` | `deploy` | Admin (sudo) user to create or update |
 | `-k, --ssh-key "KEY"` | | Public key for the admin; repeat for several |
 | `--no-copy-root-keys` | | Don't copy root's authorized keys to the admin |
-| `--sudo-nopasswd` / `--sudo-password` | auto | Passwordless sudo is the default when a key is installed |
+| `--sudo-nopasswd` / `--sudo-password` | password | sudo asks for a password by default; `--sudo-nopasswd` makes the key holder root |
 | `-p, --ssh-port PORT` | `random` | SSH port; a random free port in 1025-9999 unless you give one |
 | `--forwarding no\|local\|yes` | `local` | SSH TCP forwarding |
 | `--tcp-ports "P ..."` | `"80 443"` | Public TCP ports besides SSH |
@@ -210,10 +210,10 @@ still require review even when the exit code is zero.
   when the admin has at least one validated, unrestricted key. Setup reports incomplete and exits nonzero
   otherwise. Restricted keys already in the account remain untouched but do not qualify as an admin login.
   Add an unrestricted personal key and run the script again.
-- With a key, sudo needs no password by default, so whoever holds that key is root. Use `--sudo-password` if you
-  want sudo to require a password. This is not SSH multifactor authentication. The `docker` group of a root
-  daemon is root without a password, so with `--sudo-password` the admin is kept out of it; rootless Docker,
-  the default, has no such group.
+- sudo asks for a password by default, so root stays behind something only you know even if the SSH key leaks
+  to a laptop, a CI runner or an AI agent. `--sudo-nopasswd` drops that: whoever holds the key is root. This is
+  not SSH multifactor authentication. The `docker` group of a root daemon is root without a password, so a
+  password-required admin is kept out of it; rootless Docker, the default, has no such group.
 - Passwordless admins receive sudo permission directly and use `ssh-users` for SSH. They are removed from
   the `sudo` group because its additional password-required rule makes `sudo -v` prompt on Ubuntu 26.04.
   Use `sudo -i` for a root shell. Password-required admins remain in the `sudo` group. Test from a fresh SSH
