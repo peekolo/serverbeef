@@ -51,6 +51,8 @@ valid_name()  { [[ "$1" =~ ^[a-z0-9][a-z0-9_-]{0,31}$ && "$1" != *_deploy ]]; }
 valid_admin() { [[ "$1" =~ ^[a-z_][a-z0-9_-]{0,31}$ && "$1" != root && "$1" != deploy ]]; }
 valid_port()  { [[ "$1" =~ ^[1-9][0-9]{0,4}$ ]] && (( 10#$1 >= 1025 && 10#$1 <= 65535 )); }
 valid_role()  { [[ "$1" == admin || "$1" == deploy ]]; }
+valid_login() { [[ "$1" =~ ^[a-z_][a-z0-9_-]{0,31}$ ]]; }
+valid_any_port() { [[ "$1" =~ ^[1-9][0-9]{0,4}$ ]] && (( 10#$1 <= 65535 )); }
 valid_mode()  { [[ "${1,,}" =~ ^(u|reuse|s|reset)$ ]]; }
 always_ok()   { true; }
 expand_tilde() { printf '%s' "${1/#\~/$HOME}"; }
@@ -126,16 +128,21 @@ mkdir -p "$SSH_DIR"; chmod 700 "$SSH_DIR"; touch "$SSH_CONFIG"; chmod 600 "$SSH_
 cat <<EOF
 
 ${B}serverbeef-local: prepare your computer for a new server${N}
-  This makes two SSH keys and two ssh aliases for the server, then uploads serverbeef.sh and your answers to it.
+  Three short parts: (1) how to reach the server today, (2) what it should become (name, admin, port), (3) keys.
+  It then makes two SSH keys and two ssh aliases, and uploads serverbeef.sh with your answers to the server.
   The admin key gets a passphrase: it is the key that can become root. The deploy key is for CI and AI agents and
-  gets none: that account can never reach root. Private keys stay on this computer. Nothing on the server changes.
+  gets none: that account can never reach root. Private keys stay on this computer. Nothing on the server changes
+  until you run serverbeef.sh there.
 EOF
 
-section "Server"
+section "1. The server as it is now"
+echo "    How to reach it today, before serverbeef runs."
 ask IP "Server IP address" "" valid_ip "From your provider's dashboard."
 
 declare -a SET_ASIDE=() BLOCKS=()
 MODE=new
+NAME='' ADMIN='' PORT='' ADMIN_KEY='' DEPLOY_KEY=''
+admin_alias='' admin_user='' admin_port='' admin_idf='' deploy_alias='' deploy_idf='' deploy_port=''
 mapfile -t BLOCKS < <(config_blocks_for "$SSH_CONFIG" "$IP")
 if (( ${#BLOCKS[@]} > 0 )); then
   echo "    ~/.ssh/config already knows $IP:"
@@ -148,11 +155,8 @@ if (( ${#BLOCKS[@]} > 0 )); then
     "u = reuse: keep what exists, make only what is missing.  s = reset: remove these entries, forget the old host key, make new keys."
   case "${MODE,,}" in u|reuse) MODE=reuse ;; *) MODE=reset ;; esac
 fi
-
-NAME='' ADMIN='' PORT='' ADMIN_KEY='' DEPLOY_KEY='' UPLOAD_VIA=root
 if [[ "$MODE" == reuse ]]; then
-  # sort the blocks into an admin one and a deploy one
-  admin_alias='' admin_user='' admin_port='' admin_idf='' deploy_alias='' deploy_idf='' deploy_port=''
+  # sort the entries into an admin one and a deploy one
   for b in "${BLOCKS[@]}"; do
     IFS='|' read -r alias user port idf <<<"$b"
     if [[ "$user" == deploy || "$alias" == *_deploy ]]; then deploy_alias=$alias; deploy_idf=$idf; deploy_port=$port
@@ -163,35 +167,40 @@ if [[ "$MODE" == reuse ]]; then
   if [[ -n "$admin_idf" && -z "$deploy_idf" ]]; then
     ask ROLE "Only one key exists ($admin_idf). Is it the admin key or the deploy key?" admin valid_role \
       "The other one is made now. admin: your key with a passphrase. deploy: the key your agents use, no passphrase."
-    if [[ "$ROLE" == deploy ]]; then deploy_idf=$admin_idf; deploy_port=$admin_port; deploy_alias=$admin_alias; admin_idf=; admin_alias=; fi
+    if [[ "$ROLE" == deploy ]]; then deploy_idf=$admin_idf; deploy_port=$admin_port; deploy_alias=$admin_alias; admin_idf=''; admin_alias=''; fi
   fi
-  NAME="${admin_alias:-${deploy_alias%_deploy}}"
-  valid_name "$NAME" || ask NAME "Friendly name for this server" "" valid_name "Used as the ssh alias: ssh <name> and ssh <name>_deploy."
-  if [[ -n "$admin_idf" ]]; then
-    ADMIN="$admin_user"; PORT="${admin_port:-22}"; ADMIN_KEY="$admin_idf"
-    valid_admin "$ADMIN" || ask ADMIN "Admin username on the server" "" valid_admin "The account you log in with. Not root, not deploy."
-    ok "admin: ssh $admin_alias (user $ADMIN, port $PORT, key $ADMIN_KEY)"
-    UPLOAD_VIA='admin'
-  else
-    PORT="${deploy_port:-}"
-  fi
-  if [[ -n "$deploy_idf" ]]; then DEPLOY_KEY="$deploy_idf"; ok "deploy: key $DEPLOY_KEY"; fi
-  [[ -n "$ADMIN" ]] || ask ADMIN "Admin username on the server" "" valid_admin "Required. The account you log in with; root login gets disabled. Not root, not deploy."
-  valid_port "${PORT:-}" || ask PORT "SSH port the server uses (or will use)" "$(shuf -i 1025-9999 -n 1)" valid_port
-else
-  if [[ "$MODE" == reset ]]; then
-    echo "    At the end, after you confirm: these entries leave ~/.ssh/config (a backup is kept), the old host key of"
-    echo "    $IP is forgotten, and keys no other entry uses are set aside, not deleted. Ctrl-C before that changes nothing."
-  fi
-  ask NAME "Friendly name for this server" "" valid_name "Short, lowercase: it becomes the ssh alias (ssh <name>, ssh <name>_deploy)."
-  ask ADMIN "Admin username on the server" "" valid_admin "Required. The account you log in with; root login gets disabled. Not root, not deploy."
-  ask PORT "SSH port for this server" "$(shuf -i 1025-9999 -n 1)" valid_port "A port of its own per server. Allow it in your provider's firewall if you have one."
+  [[ -z "$deploy_idf" ]] || DEPLOY_KEY="$deploy_idf"
+elif [[ "$MODE" == reset ]]; then
+  echo "    At the end, after you confirm: these entries leave ~/.ssh/config (a backup is kept), the old host key of"
+  echo "    $IP is forgotten, and keys no other entry uses are set aside, not deleted. Ctrl-C before that changes nothing."
 fi
+# how the upload and the setup command reach the box
+NOW_USER='' NOW_PORT='' NOW_ALIAS=''
+if [[ -n "$admin_alias" ]]; then
+  NOW_ALIAS="$admin_alias"; ADMIN="$admin_user"; PORT="${admin_port:-22}"; ADMIN_KEY="$admin_idf"
+  ok "reached as $ADMIN through ssh $NOW_ALIAS (port $PORT, key $ADMIN_KEY): the server is already set up"
+else
+  ask NOW_USER "User you log in with today" root valid_login \
+    "root on most providers. Some images use ubuntu, debian or admin instead; then sudo is used on the box."
+  ask NOW_PORT "SSH port today" 22 valid_any_port
+fi
+
+section "2. The server after serverbeef"
+echo "    What you want it to be. The ssh aliases on this computer and the setup's defaults come from these."
+if valid_name "${NAME:-${admin_alias:-${deploy_alias%_deploy}}}"; then NAME="${admin_alias:-${deploy_alias%_deploy}}"; ok "name: $NAME"
+else ask NAME "Friendly name for this server" "" valid_name "Short, lowercase: it becomes the ssh alias (ssh <name>, ssh <name>_deploy)."; fi
+if valid_admin "${ADMIN:-}"; then ok "admin: $ADMIN"
+else ask ADMIN "Admin username on the server" "" valid_admin "Required. The account you log in with; root login gets disabled. Not root, not deploy."; fi
+PORT="${PORT:-$deploy_port}"
+if valid_port "${PORT:-}"; then ok "SSH port: $PORT"
+else ask PORT "SSH port for this server" "$(shuf -i 1025-9999 -n 1)" valid_port "A port of its own per server. Allow it in your provider's firewall if you have one."; fi
 
 WORK="$(mktemp -d)"; chmod 700 "$WORK"; trap 'rm -rf "$WORK"' EXIT
 declare -a NEW_KEYS=()
 
-section "Keys"
+section "3. Keys"
+[[ -z "$ADMIN_KEY" ]] || ok "admin key kept: $ADMIN_KEY"
+[[ -z "$DEPLOY_KEY" ]] || ok "deploy key kept: $DEPLOY_KEY"
 if [[ -z "$ADMIN_KEY" ]]; then
   ADMIN_KEY="$SSH_DIR/${NAME}_admin"
   echo "    The admin key's passphrase: typed every time you log in as $ADMIN (or once per session with ssh-agent)."
@@ -268,18 +277,19 @@ ADMIN_SSH_KEY="$ADMIN_PUB"
 DEPLOY_SSH_KEY="$DEPLOY_PUB"
 COPY_ROOT_KEYS=no
 EOF
-if [[ "$UPLOAD_VIA" == admin ]]; then
-  target="$NAME:"; run_cmd="ssh -t $NAME 'sudo bash serverbeef.sh --config $CONF'"
-  echo "    Uploading as $ADMIN through the existing alias (the server is already set up)."
+if [[ -n "$NOW_ALIAS" ]]; then
+  scp_target=("$NOW_ALIAS:"); run_cmd="ssh -t $NOW_ALIAS 'sudo bash serverbeef.sh --config $CONF'"
+  echo "    Uploading as $ADMIN through ssh $NOW_ALIAS."
 else
-  target="root@$IP:"; run_cmd="ssh -t root@$IP 'bash serverbeef.sh --config $CONF'"
-  echo "    Uploading as root. A fresh server asks for root's password from your provider (or uses the key you"
+  scp_target=(-P "$NOW_PORT" "$NOW_USER@$IP:")
+  run_cmd="ssh -t -p $NOW_PORT $NOW_USER@$IP '$([[ "$NOW_USER" == root ]] || echo "sudo ")bash serverbeef.sh --config $CONF'"
+  echo "    Uploading as $NOW_USER. A fresh server asks for $NOW_USER's password from your provider (or uses the key you"
   echo "    registered there). Type it once here; nothing is stored."
 fi
-if scp -o StrictHostKeyChecking=accept-new "$SERVERBEEF" "$WORK/$CONF" "$target"; then
+if scp -o StrictHostKeyChecking=accept-new "$SERVERBEEF" "$WORK/$CONF" "${scp_target[@]}"; then
   ok "uploaded serverbeef.sh and $CONF"
 else
-  warn "upload failed. Fix the connection and run: scp $SERVERBEEF $WORK/$CONF $target"
+  warn "upload failed. Fix the connection and run: scp $SERVERBEEF $WORK/$CONF ${scp_target[*]}"
   cp "$WORK/$CONF" "$SCRIPT_DIR/$CONF"; warn "the config file is kept at $SCRIPT_DIR/$CONF (public keys only)"
   trap - EXIT; rm -rf "$WORK"
 fi

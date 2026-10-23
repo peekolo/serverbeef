@@ -24,9 +24,10 @@ curl -fsSLO https://raw.githubusercontent.com/peekolo/serverbeef/HEAD/serverbeef
 bash serverbeef-local.sh
 ```
 
-It asks for the server's IP address, a short name for the server (`box1`), the admin username you want on it (your
-first name in lowercase works; `root` and `deploy` are not allowed), accepts a random SSH port, and asks for a
-passphrase. Then it:
+It asks three short sets of questions: how you reach the server today (its IP address, the user and port your
+provider gave you, usually `root` on port 22); what it should become (a short name such as `box1`, the admin
+username you want on it, where your first name in lowercase works and `root` and `deploy` are not allowed, and a
+random SSH port it offers); and a passphrase. It shows what it is about to do and waits for a yes. Then it:
 
 - makes two SSH keys: the **admin key** for you, protected by that passphrase, since it is the key that can become
   root; and the **deploy key** for your AI assistant or CI, with no passphrase, since that account can never reach
