@@ -111,10 +111,9 @@ set_aside() {     # set_aside KEYFILE: move a key pair out of the way, remembere
   mv -- "$f" "$f.replaced-$STAMP"; [[ -e "$f.pub" ]] && mv -- "$f.pub" "$f.pub.replaced-$STAMP"
   SET_ASIDE+=("$f.replaced-$STAMP")
 }
-make_key() {      # make_key FILE COMMENT PASSPHRASE
-  set_aside "$1"
-  ssh-keygen -q -t ed25519 -N "$3" -C "$2" -f "$1"
-  chmod 600 "$1"
+make_key() {      # make_key NAME COMMENT PASSPHRASE: into the work dir; installed into ~/.ssh only after the confirmation
+  ssh-keygen -q -t ed25519 -N "$3" -C "$2" -f "$WORK/$1"
+  NEW_KEYS+=("$1")
 }
 
 # ---------------------------------------------------------------------------------------------------------------
@@ -181,24 +180,16 @@ if [[ "$MODE" == reuse ]]; then
   valid_port "${PORT:-}" || ask PORT "SSH port the server uses (or will use)" "$(shuf -i 1025-9999 -n 1)" valid_port
 else
   if [[ "$MODE" == reset ]]; then
-    cp -p "$SSH_CONFIG" "$SSH_CONFIG.serverbeef-bak-$STAMP"
-    remove_blocks_for "$SSH_CONFIG" "$IP" > "$SSH_CONFIG.new-$STAMP"
-    mv -- "$SSH_CONFIG.new-$STAMP" "$SSH_CONFIG"; chmod 600 "$SSH_CONFIG"
-    ok "removed ${#BLOCKS[@]} entr$([[ ${#BLOCKS[@]} == 1 ]] && echo y || echo ies) from ~/.ssh/config (backup: config.serverbeef-bak-$STAMP)"
-    ssh-keygen -R "$IP" >/dev/null 2>&1 || true
-    for b in "${BLOCKS[@]}"; do
-      IFS='|' read -r alias _ port idf <<<"$b"
-      if [[ -n "$port" && "$port" != 22 ]]; then ssh-keygen -R "[$IP]:$port" >/dev/null 2>&1 || true; fi
-      ssh-keygen -R "$alias" >/dev/null 2>&1 || true
-      if [[ -n "$idf" ]] && ! key_used_elsewhere "$SSH_CONFIG" "$IP" "$idf"; then set_aside "$idf"; fi
-    done
-    ok "forgot the old host key of $IP (a reinstalled server has a new one)"
-    (( ${#SET_ASIDE[@]} == 0 )) || ok "old keys set aside, not deleted: ${SET_ASIDE[*]}"
+    echo "    At the end, after you confirm: these entries leave ~/.ssh/config (a backup is kept), the old host key of"
+    echo "    $IP is forgotten, and keys no other entry uses are set aside, not deleted. Ctrl-C before that changes nothing."
   fi
   ask NAME "Friendly name for this server" "" valid_name "Short, lowercase: it becomes the ssh alias (ssh <name>, ssh <name>_deploy)."
   ask ADMIN "Admin username on the server" "" valid_admin "Required. The account you log in with; root login gets disabled. Not root, not deploy."
   ask PORT "SSH port for this server" "$(shuf -i 1025-9999 -n 1)" valid_port "A port of its own per server. Allow it in your provider's firewall if you have one."
 fi
+
+WORK="$(mktemp -d)"; chmod 700 "$WORK"; trap 'rm -rf "$WORK"' EXIT
+declare -a NEW_KEYS=()
 
 section "Keys"
 if [[ -z "$ADMIN_KEY" ]]; then
@@ -210,16 +201,55 @@ if [[ -z "$ADMIN_KEY" ]]; then
     [[ -n "$p1" && "$p1" == "$p2" ]] && break
     printf '    %s%s%s\n' "$R" "$([[ -z "$p1" ]] && echo "A passphrase is required for the admin key." || echo "They differ, try again.")" "$N"
   done
-  make_key "$ADMIN_KEY" "$ADMIN@$NAME" "$p1"; unset p1 p2
-  ok "admin key $ADMIN_KEY (passphrase)"
+  make_key "${NAME}_admin" "$ADMIN@$NAME" "$p1"; unset p1 p2
+  ok "admin key made: $ADMIN_KEY (passphrase)"
 fi
 if [[ -z "$DEPLOY_KEY" ]]; then
   DEPLOY_KEY="$SSH_DIR/${NAME}_deploy"
-  make_key "$DEPLOY_KEY" "deploy@$NAME" ""
-  ok "deploy key $DEPLOY_KEY (no passphrase)"
+  make_key "${NAME}_deploy" "deploy@$NAME" ""
+  ok "deploy key made: $DEPLOY_KEY (no passphrase)"
 fi
-ADMIN_PUB="$(cat "$(expand_tilde "$ADMIN_KEY").pub")"
-DEPLOY_PUB="$(cat "$(expand_tilde "$DEPLOY_KEY").pub")"
+pub_of() { local f; f="$(expand_tilde "$1")"; if [[ -f "$WORK/$(basename "$f").pub" ]]; then cat "$WORK/$(basename "$f").pub"; else cat "$f.pub"; fi; }
+ADMIN_PUB="$(pub_of "$ADMIN_KEY")"
+DEPLOY_PUB="$(pub_of "$DEPLOY_KEY")"
+
+section "About to change ~/.ssh"
+if [[ "$MODE" == reset ]]; then
+  echo "    remove ${#BLOCKS[@]} entr$([[ ${#BLOCKS[@]} == 1 ]] && echo y || echo ies) for $IP from ~/.ssh/config (backup kept), forget its old host key, set old keys aside"
+fi
+for k in "${NEW_KEYS[@]}"; do
+  echo "    install $SSH_DIR/$k$([[ -e "$SSH_DIR/$k" ]] && echo " (the file there now is set aside)")"
+done
+for entry in "$NAME:$ADMIN" "${NAME}_deploy:deploy"; do
+  IFS=: read -r alias user <<<"$entry"
+  if [[ "$MODE" != reset ]] && grep -qE "^[[:space:]]*Host[[:space:]]+$alias([[:space:]]|$)" "$SSH_CONFIG"; then echo "    keep   ssh $alias"
+  else echo "    add    ssh $alias  (user $user, port $PORT)"; fi
+done
+echo "    upload serverbeef.sh and serverbeef-$NAME.conf (public keys only) to the server"
+ask_yn GO "Go ahead?" yes
+[[ "$GO" == yes ]] || die "stopped; nothing changed"
+
+if [[ "$MODE" == reset ]]; then
+  cp -p "$SSH_CONFIG" "$SSH_CONFIG.serverbeef-bak-$STAMP"
+  remove_blocks_for "$SSH_CONFIG" "$IP" > "$SSH_CONFIG.new-$STAMP"
+  mv -- "$SSH_CONFIG.new-$STAMP" "$SSH_CONFIG"; chmod 600 "$SSH_CONFIG"
+  ok "removed the entries for $IP from ~/.ssh/config (backup: config.serverbeef-bak-$STAMP)"
+  ssh-keygen -R "$IP" >/dev/null 2>&1 || true
+  for b in "${BLOCKS[@]}"; do
+    IFS='|' read -r alias _ port idf <<<"$b"
+    if [[ -n "$port" && "$port" != 22 ]]; then ssh-keygen -R "[$IP]:$port" >/dev/null 2>&1 || true; fi
+    ssh-keygen -R "$alias" >/dev/null 2>&1 || true
+    if [[ -n "$idf" ]] && ! key_used_elsewhere "$SSH_CONFIG" "$IP" "$idf"; then set_aside "$idf"; fi
+  done
+  ok "forgot the old host key of $IP (a reinstalled server has a new one)"
+fi
+for k in "${NEW_KEYS[@]}"; do
+  set_aside "$SSH_DIR/$k"
+  mv -- "$WORK/$k" "$SSH_DIR/$k"; mv -- "$WORK/$k.pub" "$SSH_DIR/$k.pub"
+  chmod 600 "$SSH_DIR/$k"; chmod 644 "$SSH_DIR/$k.pub"
+  ok "installed $SSH_DIR/$k"
+done
+(( ${#SET_ASIDE[@]} == 0 )) || ok "old keys set aside, not deleted: ${SET_ASIDE[*]}"
 
 section "ssh aliases"
 for entry in "$NAME:$ADMIN:$ADMIN_KEY" "${NAME}_deploy:deploy:$DEPLOY_KEY"; do
@@ -229,7 +259,6 @@ for entry in "$NAME:$ADMIN:$ADMIN_KEY" "${NAME}_deploy:deploy:$DEPLOY_KEY"; do
 done
 
 section "Upload"
-WORK="$(mktemp -d)"; trap 'rm -rf "$WORK"' EXIT
 CONF="serverbeef-$NAME.conf"
 cat > "$WORK/$CONF" <<EOF
 # Made by serverbeef-local.sh on $(hostname) for $NAME ($IP). Public keys only.
