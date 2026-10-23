@@ -289,8 +289,11 @@ fi
 if scp -o StrictHostKeyChecking=accept-new "$SERVERBEEF" "$WORK/$CONF" "${scp_target[@]}"; then
   ok "uploaded serverbeef.sh and $CONF"
 else
-  warn "upload failed. Fix the connection and run: scp $SERVERBEEF $WORK/$CONF ${scp_target[*]}"
-  cp "$WORK/$CONF" "$SCRIPT_DIR/$CONF"; warn "the config file is kept at $SCRIPT_DIR/$CONF (public keys only)"
+  cp "$WORK/$CONF" "$SCRIPT_DIR/$CONF"
+  warn "upload failed. The config file is kept at $SCRIPT_DIR/$CONF (public keys only). When the connection works, run:"
+  warn "  scp ${scp_target[*]:0:${#scp_target[@]}-1} $SERVERBEEF $SCRIPT_DIR/$CONF ${scp_target[*]: -1}"
+  echo "    Permission denied: wrong password, or that user only takes a key registered at the provider (ssh -i <that key>)."
+  echo "    Connection reset: too many attempts in a row; wait a minute."
   trap - EXIT; rm -rf "$WORK"
 fi
 
