@@ -14,68 +14,67 @@ takes about ten minutes.
 You need the server's IP address (it's on your provider's dashboard) and a terminal on your own computer: the
 Terminal app on a Mac, or PowerShell on Windows.
 
-### 1. Make a login key on your computer
+### 1. On your computer: `serverbeef-local.sh`
 
-A key is a pair of files that lets you log in using a private credential stored on your computer. Skip this step if you already
-have one.
-
-In the terminal on your computer, run:
+Download both scripts and run the local one in the terminal on your computer:
 
 ```bash
-ssh-keygen -t ed25519
+curl -fsSLO https://raw.githubusercontent.com/peekolo/serverbeef/HEAD/serverbeef.sh
+curl -fsSLO https://raw.githubusercontent.com/peekolo/serverbeef/HEAD/serverbeef-local.sh
+bash serverbeef-local.sh
 ```
 
-Accept the default file location unless you already have a key there. Protect the private key with a passphrase.
-Then print your public key:
+It asks for the server's IP address, a short name for the server (`box1`), the admin username you want on it (your
+first name in lowercase works; `root` and `deploy` are not allowed), accepts a random SSH port, and asks for a
+passphrase. Then it:
+
+- makes two SSH keys: the **admin key** for you, protected by that passphrase, since it is the key that can become
+  root; and the **deploy key** for your AI assistant or CI, with no passphrase, since that account can never reach
+  root;
+- adds two entries to `~/.ssh/config`, so that later `ssh box1` is you and `ssh box1_deploy` is the deploy account;
+- uploads `serverbeef.sh` and a small file with your answers to the server as root. A fresh server asks for root's
+  password here (it is on your provider's dashboard), or uses the key you registered at the provider; type it once,
+  nothing is stored.
+
+Private keys never leave your computer. Run it again for the same IP and it offers to reuse what exists or, after you
+reinstalled the server, to reset it.
+
+### 2. On the server: `serverbeef.sh`
+
+The local script ends by printing the exact command. It looks like this:
 
 ```bash
-cat ~/.ssh/id_ed25519.pub
+ssh -t root@YOUR_SERVER_IP 'bash serverbeef.sh --config serverbeef-box1.conf'
 ```
 
-You'll see one long line that starts with `ssh-ed25519`. Copy the whole line; you'll paste it in step 3. (If
-`ssh-keygen` says the file already exists, you have a key already. Type `n`, then run the `cat` command.)
+The first time, ssh asks whether you want to continue connecting: type `yes`. The script explains what it is about
+to do, then asks a few questions. Your admin name, port and both keys are already filled in from step 1; pressing
+Enter accepts the suggested answer shown in `[brackets]`, and that is fine for most of them. Two worth a thought:
 
-### 2. Log in to your server
+- sudo asks for a password: keep that. Type one you will remember or let it generate one, and save it in a
+  password manager. It is what stands between anyone holding a key and root.
+- If your app runs in Docker, answer yes to the Docker question and keep the rootless mode: Docker then runs as the
+  `deploy` account, so nothing inside a container, and nothing your AI assistant does through Docker, can reach root.
 
-```bash
-ssh root@YOUR_SERVER_IP
-```
+Before it changes anything, it shows a summary and asks you to confirm. If a password is generated, it is delivered
+privately before changing the account, so a later setup failure cannot lose it. Without a terminal it is saved in a
+root-only file; the script prints that file's path. Delete the file after saving the password securely.
 
-Put your server's IP address in place of `YOUR_SERVER_IP`. The first time, it asks whether you want to continue
-connecting: type `yes`. If it asks for a password, use the root password from your provider.
+### 3. Without the local script
 
-### 3. Run serverbeef
-
-Copy this line into the server window and press Enter:
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/peekolo/serverbeef/HEAD/serverbeef.sh -o serverbeef.sh && bash serverbeef.sh
-```
-
-It asks a few questions. Pressing Enter accepts the suggested answer shown in `[brackets]`, and that is fine for most
-of them. Answer these ones yourself:
-
-- For the admin username, type a short name of your own, such as your first name in lowercase. You'll log in with
-  this account from now on, because logging in as root gets turned off.
-- When it asks for a public key, paste the line you copied in step 1. Only copy keys from root if you recognize
-  them as your personal admin keys. Restricted root keys are skipped; their restrictions are never stripped.
-- If your app runs in Docker, answer yes to the Docker question and keep the rootless mode: the Docker daemon
-  then runs as a separate user, `deploy`, so nothing inside a container can reach root, and an AI assistant or
-  CI that deploys through Docker works as `deploy`, never as your admin account.
-
-Before it changes anything, it shows a summary and asks you to confirm. Find the SSH port there (a number
-like `4821`) and write it down: from now on you log in on that port. At the end it prints the exact login command.
-If a password is generated, save it in a password manager. It is delivered privately before changing the account,
-so a later setup failure cannot lose it. Without a terminal it is saved in a root-only file; the script prints
-that file's path. Delete the file after saving the password securely.
+You can also log in as root (`ssh root@YOUR_SERVER_IP`) and run
+`curl -fsSL https://raw.githubusercontent.com/peekolo/serverbeef/HEAD/serverbeef.sh -o serverbeef.sh && bash serverbeef.sh`
+there. Then it asks for everything, including the admin name and a public key to paste. Make that key on your
+computer first with `ssh-keygen -t ed25519` and paste the contents of the `.pub` file. Only copy keys from root if
+you recognize them as your own. Restricted root keys are skipped; their restrictions are never stripped.
 
 ### 4. Test the new login before you close anything
 
-**Leave the server window open.** Open a second terminal window on your computer and run the command from the end of
-the setup. It looks like this:
+**Leave the server window open.** Open a second terminal window on your computer and log in as the admin, with the
+alias from step 1 or the command from the end of the setup:
 
 ```bash
-ssh -p 4821 yourname@YOUR_SERVER_IP
+ssh box1          # or: ssh -p 4821 yourname@YOUR_SERVER_IP
 sudo -v
 ```
 
@@ -85,8 +84,8 @@ If it doesn't connect, keep the first window open, since it is still logged in a
 is a firewall on your provider's dashboard (often called "Firewall" or "Security group") that blocks the new port.
 Add a rule there that allows TCP on your SSH port, then try again.
 
-From now on, log in with `ssh -p <port> <yourname>@<ip>`. To check the server later, run `sudo serverbeef --verify`
-on it.
+From now on, `ssh box1` is you and `ssh box1_deploy` is the deploy account your AI assistant or CI uses: its own key,
+no sudo, no password. To check the server later, run `sudo serverbeef --verify` on it.
 
 ### 5. Put your app online
 
@@ -129,7 +128,7 @@ pipe anything from the internet into a root shell.
 |---|---|
 | 1. Packages | Full upgrade, then common tools (curl, jq, git, htop, tmux, vim, dnsutils...), ufw, fail2ban, unattended-upgrades, chrony, AppArmor, Lynis. `needrestart` restarts services without asking |
 | 2. Hostname, time | Optional hostname and timezone; time sync with chrony |
-| 3. Admin user | Creates the sudo user, installs your public key(s) and optionally copies unrestricted, validated root keys. sudo asks for a password (generated if needed, delivered privately to the terminal or a root-only file and never written to the log); `--sudo-nopasswd` for passwordless sudo |
+| 3. Accounts | The admin user (a name you choose; no default), with your public key(s) and optionally unrestricted, validated root keys. sudo asks for a password (generated if needed, delivered privately to the terminal or a root-only file and never written to the log); `--sudo-nopasswd` for passwordless sudo. And the `deploy` user for CI and agents: its own key from `--deploy-key`, no password, no sudo, removed from privileged groups |
 | 4. SSH | A port of its own for each server (random unless you choose one), key-only login, no root login, only the `sudo` and `ssh-users` groups may log in, agent/X11 forwarding off, `ssh -L` tunnels allowed by default. The config is tested with `sshd -t` before it is used |
 | 5. Firewall | UFW denies incoming by default; SSH (rate limited), 80/tcp, 443/tcp and 443/udp are open. `--tcp-ports` and `--udp-ports` change the list |
 | 6. Fail2ban | SSH jail in aggressive mode, bans that get longer for repeat offenders, and a recidive jail (one week) |
@@ -137,7 +136,7 @@ pipe anything from the internet into a root shell.
 | 8. Kernel, network | BBR and fq, larger queues and buffers, SYN cookies, no redirects or source routing, restricted kernel pointers, dmesg, ptrace and unprivileged BPF |
 | 9. Swap, limits, logs | A swap file sized to RAM (1 to 4 GB) if there is none, higher open-file limits, journald capped at 1 GB and one month |
 | 10. Misc | Core dumps off, `su` limited to the sudo group, home folders private, unused protocols and filesystems blocked, Ctrl-Alt-Del from the provider console ignored |
-| 11. Docker (optional) | Rootless Docker and Compose from Ubuntu's packages: the daemon runs as a separate Docker user (`deploy` unless `--docker-user` says otherwise, created if missing, no sudo), the root daemon is off and masked, nobody is in the `docker` group, ports 80 and 443 can be published without root, pasta keeps the visitor's source address, log rotation. `--docker-rootful` installs the classic root daemon instead |
+| 11. Docker (optional) | Rootless Docker and Compose from Ubuntu's packages: the daemon runs as the `deploy` user, the root daemon is off and masked, nobody is in the `docker` group, ports 80 and 443 can be published without root, pasta keeps the visitor's source address, log rotation. `--docker-rootful` installs the classic root daemon instead |
 
 Managed drop-ins have `serverbeef` in their name (`/etc/ssh/sshd_config.d/00-serverbeef.conf`,
 `/etc/sysctl.d/90-serverbeef.conf` and so on), so you can see what came from the script. A few shared files, such
@@ -149,8 +148,10 @@ saved in `/etc/serverbeef/state.conf` (never passwords or keys), and the script 
 
 | Flag | Default | Meaning |
 |---|---|---|
-| `-u, --user NAME` | `deploy` | Admin (sudo) user to create or update |
+| `-u, --user NAME` | required | Admin (sudo) user to create or update: you. Not `root`, not the deploy user |
 | `-k, --ssh-key "KEY"` | | Public key for the admin; repeat for several |
+| `--deploy-user NAME` | `deploy` | The deployment account for CI and agents: no sudo, no password, runs Docker |
+| `--deploy-key "KEY"` | | Public key for the deploy user; repeat for several. Keep it separate from your admin key |
 | `--no-copy-root-keys` | | Don't copy root's authorized keys to the admin |
 | `--sudo-nopasswd` / `--sudo-password` | password | sudo asks for a password by default; `--sudo-nopasswd` makes the key holder root |
 | `-p, --ssh-port PORT` | `random` | SSH port; a random free port in 1025-9999 unless you give one |
@@ -161,7 +162,6 @@ saved in `/etc/serverbeef/state.conf` (never passwords or keys), and the script 
 | `--swap auto\|none\|2G` | `auto` | Swap file size |
 | `--auto-reboot` / `--no-auto-reboot`, `--reboot-time HH:MM` | on, `04:00` | Reboots after updates |
 | `--docker` / `--no-docker` | off | Install rootless Docker and Compose |
-| `--docker-user NAME` | `deploy` | User who runs rootless Docker (created if missing, no sudo). Changing it on a re-run stops the previous user's daemon |
 | `--docker-rootful` | | The classic root daemon instead of rootless Docker |
 | `--verify` | | Check a server this script already set up |
 | `--setup` | | On a re-run, skip the menu and run setup again |
@@ -200,8 +200,12 @@ still require review even when the exit code is zero.
   `-p 5432:5432` is open to the internet whatever UFW says: bind internal services to localhost
   (`-p 127.0.0.1:5432:5432`), put a firewall at your provider in front of the server, or both. The script warns
   about this and the verify mode lists exposed ports.
-- Rootless Docker runs as one user. Use it from that account (`ssh deploy@...`, or `sudo -iu deploy`); `sudo docker`
-  talks to a root daemon that is not there. Each user who should run containers needs their own daemon.
+- Rootless Docker runs as the deploy user. Use it from that account (`ssh box1_deploy`, or `sudo -iu deploy`);
+  `sudo docker` talks to a root daemon that is not there. Changing `--deploy-user` on a re-run moves the daemon and
+  stops the old one.
+- Two keys on purpose. The admin key, with a passphrase, is the one that can become root; the deploy key, without,
+  is what your AI assistant or CI holds and can never reach root. If both live on the same computer, the
+  passphrase is what keeps an agent from simply using the admin key.
 - If your provider has a firewall in front of the server, choose the SSH port before you run the script
   (`--ssh-port 4821`, or let the wizard pick one and note it) and allow it there, or you can't log in on it.
 - Port 22 stays open in UFW until you remove it. If your provider added a rule for port 22, the script prints the

@@ -16,8 +16,9 @@ root on the server. This file covers running it for someone and changing it.
    that ran the script is closed, someone must log in from a second connection: `ssh -p <port> <admin>@<ip>`, then
    `sudo -v`. Never close the
    root session or reboot before that works.
-4. **Don't pick `deploy` as the admin out of habit.** It is the default name, but setups that keep a separate
-   unprivileged `deploy` user for app deployments need the admin to have a different name. Ask the owner.
+4. **The admin has no default name; `deploy` is the deployment account.** Ask the owner for the admin name (a
+   human's account, sudo behind a password). The script also creates `deploy`: no sudo, no password, its own key
+   from `--deploy-key`, runs Docker. That is the account an agent gets; never copy the admin's key to it.
 5. **Use verify mode to check a server**: `sudo serverbeef --verify`. It only changes something (deleting leftover
    firewall rules) after a yes. In a non-interactive shell, a re-run with no mode flag runs setup again, so pass
    `--verify` explicitly.
@@ -28,9 +29,13 @@ root on the server. This file covers running it for someone and changing it.
 Unattended run:
 
 ```bash
-ssh -t root@<ip> 'bash serverbeef.sh --yes --user <admin> --ssh-port <port> --ssh-key "<public key>" \
-                   [--docker] [--udp-ports none]'
+ssh -t root@<ip> 'bash serverbeef.sh --yes --user <admin> --ssh-port <port> --ssh-key "<admin public key>" \
+                   --deploy-key "<deploy public key>" [--docker] [--udp-ports none]'
 ```
+
+The owner's own computer is prepared by `serverbeef-local.sh` (keys, `~/.ssh/config` aliases `<name>` and
+`<name>_deploy`, upload). It runs on the workstation, never on the server, and its tests live in
+`tests/test_local.py`.
 
 ## Changing the script
 

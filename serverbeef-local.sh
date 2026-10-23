@@ -1,0 +1,282 @@
+#!/usr/bin/env bash
+# serverbeef-local.sh: run this on YOUR computer first, once per server.
+#
+# It prepares everything the server setup needs from your side:
+#   1. two SSH keys: an admin key for you (protected by a passphrase, it is the key that can become root) and a
+#      deploy key for CI and AI agents (no passphrase; it never gets root),
+#   2. two entries in ~/.ssh/config, <name> and <name>_deploy, so that `ssh <name>` just works afterwards,
+#   3. a small config file with your answers (admin name, SSH port, both public keys), uploaded next to
+#      serverbeef.sh so the setup on the server shows them as its defaults.
+#
+# Run it again for the same IP and it offers to reuse what exists (for example to add the missing deploy key)
+# or to reset it after you reinstalled the server. Private keys never leave this computer.
+#
+#   bash serverbeef-local.sh            # asks: server IP, friendly name, admin name, SSH port, passphrase
+set -Eeuo pipefail
+
+SSH_DIR="$HOME/.ssh"
+SSH_CONFIG="$SSH_DIR/config"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SERVERBEEF="$SCRIPT_DIR/serverbeef.sh"
+STAMP="$(date +%Y%m%d%H%M%S)"
+
+if [[ -t 1 ]]; then B=$'\e[1m'; G=$'\e[32m'; Y=$'\e[33m'; R=$'\e[31m'; D=$'\e[2m'; N=$'\e[0m'; else B='' G='' Y='' R='' D='' N=''; fi
+ok()   { printf '%s  ✔%s %s\n' "$G" "$N" "$*"; }
+warn() { printf '%s  ⚠ %s%s\n' "$Y" "$*" "$N" >&2; }
+die()  { printf '%s  ✖ %s%s\n' "$R" "$*" "$N" >&2; exit 1; }
+section() { printf '\n%s── %s%s\n' "$B" "$*" "$N"; }
+
+# ask VAR "Question" DEFAULT VALIDATOR [hint]
+ask() {
+  local __var="$1" __q="$2" __def="$3" __check="$4" __hint="${5:-}" __ans
+  while true; do
+    [[ -n "$__hint" ]] && printf '    %s%s%s\n' "$D" "$__hint" "$N"
+    read -r -p "  ${B}${__q}${N} [${__def:-none}]: " __ans < /dev/tty || { echo; die "no answer, nothing changed"; }
+    __ans="${__ans:-$__def}"
+    if "$__check" "$__ans"; then printf -v "$__var" '%s' "$__ans"; return 0; fi
+    printf '    %sInvalid value, try again.%s\n' "$R" "$N"; __hint=""
+  done
+}
+# ask_yn VAR "Question?" yes|no
+ask_yn() {
+  local __var="$1" __q="$2" __def="$3" __ans
+  while true; do
+    read -r -p "  ${B}${__q}${N} [$([[ "$__def" == yes ]] && echo Y/n || echo y/N)]: " __ans < /dev/tty || { echo; die "no answer, nothing changed"; }
+    case "${__ans:-$__def}" in y|Y|yes|YES) printf -v "$__var" yes; return ;; n|N|no|NO) printf -v "$__var" no; return ;; esac
+  done
+}
+
+valid_ip()    { [[ "$1" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] || [[ "$1" =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$ ]]; }
+valid_name()  { [[ "$1" =~ ^[a-z0-9][a-z0-9_-]{0,31}$ && "$1" != *_deploy ]]; }
+valid_admin() { [[ "$1" =~ ^[a-z_][a-z0-9_-]{0,31}$ && "$1" != root && "$1" != deploy ]]; }
+valid_port()  { [[ "$1" =~ ^[1-9][0-9]{0,4}$ ]] && (( 10#$1 >= 1025 && 10#$1 <= 65535 )); }
+valid_role()  { [[ "$1" == admin || "$1" == deploy ]]; }
+valid_mode()  { [[ "$1" == reuse || "$1" == reset ]]; }
+always_ok()   { true; }
+expand_tilde() { printf '%s' "${1/#\~/$HOME}"; }
+
+# config_blocks_for FILE IP: every Host block of FILE whose HostName (or Host) is IP, one per line:
+#   alias|user|port|identityfile   (empty fields when the block does not set them)
+config_blocks_for() {
+  [[ -f "$1" ]] || return 0
+  awk -v ip="$2" '
+    function flush() { if (alias != "" && (tolower(hn) == tolower(ip) || (hn == "" && alias == ip))) print alias "|" user "|" port "|" idf }
+    tolower($1) == "host" || tolower($1) == "match" { flush(); alias = (tolower($1) == "host") ? $2 : ""; hn = ""; user = ""; port = ""; idf = ""; next }
+    tolower($1) == "hostname"     { hn = $2 }
+    tolower($1) == "user"         { user = $2 }
+    tolower($1) == "port"         { port = $2 }
+    tolower($1) == "identityfile" { if (idf == "") idf = $2 }
+    END { flush() }
+  ' "$1"
+}
+# remove_blocks_for FILE IP: FILE without those blocks (and the blank lines right before them), to stdout
+remove_blocks_for() {
+  [[ -f "$1" ]] || return 0
+  awk -v ip="$2" '
+    function flush() {
+      if (n == 0) return
+      drop = (alias != "" && (tolower(hn) == tolower(ip) || (hn == "" && alias == ip)))
+      if (!drop) for (i = 1; i <= n; i++) print buf[i]
+      n = 0
+    }
+    tolower($1) == "host" || tolower($1) == "match" { flush(); alias = (tolower($1) == "host") ? $2 : ""; hn = "" }
+    tolower($1) == "hostname" { hn = $2 }
+    { buf[++n] = $0 }
+    END { flush() }
+  ' "$1" | cat -s
+}
+# key_used_elsewhere FILE IP KEYFILE: is KEYFILE an IdentityFile of a block for another host?
+key_used_elsewhere() {
+  local idf
+  while IFS= read -r idf; do
+    [[ -n "$idf" && "$(expand_tilde "$idf")" == "$(expand_tilde "$3")" ]] && return 0
+  done < <(awk -v ip="$2" '
+    function flush() { if (alias != "" && !(tolower(hn) == tolower(ip) || (hn == "" && alias == ip))) for (i = 1; i <= k; i++) print idfs[i]; k = 0 }
+    tolower($1) == "host" || tolower($1) == "match" { flush(); alias = (tolower($1) == "host") ? $2 : ""; hn = ""; next }
+    tolower($1) == "hostname" { hn = $2 }
+    tolower($1) == "identityfile" { idfs[++k] = $2 }
+    END { flush() }
+  ' "$1")
+  return 1
+}
+write_block() {   # write_block ALIAS USER KEYFILE: appended after one blank line
+  local gap=$'\n'
+  [[ -s "$SSH_CONFIG" ]] || gap=""
+  [[ "$(tail -c 2 "$SSH_CONFIG" 2>/dev/null | tr -c '\n' x)" == $'\n\n' ]] && gap=""
+  printf '%sHost %s\n  HostName %s\n  Port %s\n  User %s\n  IdentityFile %s\n  IdentitiesOnly yes\n' "$gap" "$1" "$IP" "$PORT" "$2" "$3" >> "$SSH_CONFIG"
+}
+set_aside() {     # set_aside KEYFILE: move a key pair out of the way, remembered for the cleanup question
+  local f; f="$(expand_tilde "$1")"
+  [[ -e "$f" ]] || return 0
+  mv -- "$f" "$f.replaced-$STAMP"; [[ -e "$f.pub" ]] && mv -- "$f.pub" "$f.pub.replaced-$STAMP"
+  SET_ASIDE+=("$f.replaced-$STAMP")
+}
+make_key() {      # make_key FILE COMMENT PASSPHRASE
+  set_aside "$1"
+  ssh-keygen -q -t ed25519 -N "$3" -C "$2" -f "$1"
+  chmod 600 "$1"
+}
+
+# ---------------------------------------------------------------------------------------------------------------
+[[ "${1:-}" == -h || "${1:-}" == --help ]] && { sed -n '2,15p' "$0"; exit 0; }
+for c in ssh ssh-keygen scp awk; do command -v "$c" >/dev/null || die "missing command: $c"; done
+[[ -f "$SERVERBEEF" ]] || die "serverbeef.sh not found next to this script ($SERVERBEEF)"
+{ : < /dev/tty; } 2>/dev/null || die "needs a terminal"
+mkdir -p "$SSH_DIR"; chmod 700 "$SSH_DIR"; touch "$SSH_CONFIG"; chmod 600 "$SSH_CONFIG"
+
+cat <<EOF
+
+${B}serverbeef-local: prepare your computer for a new server${N}
+  This makes two SSH keys and two ssh aliases for the server, then uploads serverbeef.sh and your answers to it.
+  The admin key gets a passphrase: it is the key that can become root. The deploy key is for CI and AI agents and
+  gets none: that account can never reach root. Private keys stay on this computer. Nothing on the server changes.
+EOF
+
+section "Server"
+ask IP "Server IP address" "" valid_ip "From your provider's dashboard."
+
+declare -a SET_ASIDE=() BLOCKS=()
+MODE=new
+mapfile -t BLOCKS < <(config_blocks_for "$SSH_CONFIG" "$IP")
+if (( ${#BLOCKS[@]} > 0 )); then
+  echo "    ~/.ssh/config already knows $IP:"
+  for b in "${BLOCKS[@]}"; do
+    IFS='|' read -r alias user port idf <<<"$b"
+    printf '      ssh %-20s user %-12s port %-6s key %s%s\n' "$alias" "${user:-?}" "${port:-22}" "${idf:-none}" \
+      "$([[ -n "$idf" && ! -f "$(expand_tilde "$idf")" ]] && echo " (missing!)")"
+  done
+  ask MODE "Reuse these entries and keys, or reset (you reinstalled the server)?" reuse valid_mode \
+    "reuse: keep what exists, make only what is missing. reset: remove these entries, forget the old host key, make new keys."
+fi
+
+NAME='' ADMIN='' PORT='' ADMIN_KEY='' DEPLOY_KEY='' UPLOAD_VIA=root
+if [[ "$MODE" == reuse ]]; then
+  # sort the blocks into an admin one and a deploy one
+  admin_alias='' admin_user='' admin_port='' admin_idf='' deploy_alias='' deploy_idf='' deploy_port=''
+  for b in "${BLOCKS[@]}"; do
+    IFS='|' read -r alias user port idf <<<"$b"
+    if [[ "$user" == deploy || "$alias" == *_deploy ]]; then deploy_alias=$alias; deploy_idf=$idf; deploy_port=$port
+    else admin_alias=$alias; admin_user=$user; admin_port=$port; admin_idf=$idf; fi
+  done
+  if [[ -n "$admin_idf" && ! -f "$(expand_tilde "$admin_idf")" ]]; then die "the admin key $admin_idf is gone; choose reset"; fi
+  if [[ -n "$deploy_idf" && ! -f "$(expand_tilde "$deploy_idf")" ]]; then die "the deploy key $deploy_idf is gone; choose reset"; fi
+  if [[ -n "$admin_idf" && -z "$deploy_idf" ]]; then
+    ask ROLE "Only one key exists ($admin_idf). Is it the admin key or the deploy key?" admin valid_role \
+      "The other one is made now. admin: your key with a passphrase. deploy: the key your agents use, no passphrase."
+    if [[ "$ROLE" == deploy ]]; then deploy_idf=$admin_idf; deploy_port=$admin_port; deploy_alias=$admin_alias; admin_idf=; admin_alias=; fi
+  fi
+  NAME="${admin_alias:-${deploy_alias%_deploy}}"
+  valid_name "$NAME" || ask NAME "Friendly name for this server" "" valid_name "Used as the ssh alias: ssh <name> and ssh <name>_deploy."
+  if [[ -n "$admin_idf" ]]; then
+    ADMIN="$admin_user"; PORT="${admin_port:-22}"; ADMIN_KEY="$admin_idf"
+    valid_admin "$ADMIN" || ask ADMIN "Admin username on the server" "" valid_admin "The account you log in with. Not root, not deploy."
+    ok "admin: ssh $admin_alias (user $ADMIN, port $PORT, key $ADMIN_KEY)"
+    UPLOAD_VIA='admin'
+  else
+    PORT="${deploy_port:-}"
+  fi
+  if [[ -n "$deploy_idf" ]]; then DEPLOY_KEY="$deploy_idf"; ok "deploy: key $DEPLOY_KEY"; fi
+  [[ -n "$ADMIN" ]] || ask ADMIN "Admin username on the server" "" valid_admin "Required. The account you log in with; root login gets disabled. Not root, not deploy."
+  valid_port "${PORT:-}" || ask PORT "SSH port the server uses (or will use)" "$(shuf -i 1025-9999 -n 1)" valid_port
+else
+  if [[ "$MODE" == reset ]]; then
+    cp -p "$SSH_CONFIG" "$SSH_CONFIG.serverbeef-bak-$STAMP"
+    remove_blocks_for "$SSH_CONFIG" "$IP" > "$SSH_CONFIG.new-$STAMP"
+    mv -- "$SSH_CONFIG.new-$STAMP" "$SSH_CONFIG"; chmod 600 "$SSH_CONFIG"
+    ok "removed ${#BLOCKS[@]} entr$([[ ${#BLOCKS[@]} == 1 ]] && echo y || echo ies) from ~/.ssh/config (backup: config.serverbeef-bak-$STAMP)"
+    ssh-keygen -R "$IP" >/dev/null 2>&1 || true
+    for b in "${BLOCKS[@]}"; do
+      IFS='|' read -r alias _ port idf <<<"$b"
+      if [[ -n "$port" && "$port" != 22 ]]; then ssh-keygen -R "[$IP]:$port" >/dev/null 2>&1 || true; fi
+      ssh-keygen -R "$alias" >/dev/null 2>&1 || true
+      if [[ -n "$idf" ]] && ! key_used_elsewhere "$SSH_CONFIG" "$IP" "$idf"; then set_aside "$idf"; fi
+    done
+    ok "forgot the old host key of $IP (a reinstalled server has a new one)"
+    (( ${#SET_ASIDE[@]} == 0 )) || ok "old keys set aside, not deleted: ${SET_ASIDE[*]}"
+  fi
+  ask NAME "Friendly name for this server" "" valid_name "Short, lowercase: it becomes the ssh alias (ssh <name>, ssh <name>_deploy)."
+  ask ADMIN "Admin username on the server" "" valid_admin "Required. The account you log in with; root login gets disabled. Not root, not deploy."
+  ask PORT "SSH port for this server" "$(shuf -i 1025-9999 -n 1)" valid_port "A port of its own per server. Allow it in your provider's firewall if you have one."
+fi
+
+section "Keys"
+if [[ -z "$ADMIN_KEY" ]]; then
+  ADMIN_KEY="$SSH_DIR/${NAME}_admin"
+  echo "    The admin key's passphrase: typed every time you log in as $ADMIN (or once per session with ssh-agent)."
+  while true; do
+    read -r -s -p "  ${B}Passphrase for the admin key${N}: " p1 < /dev/tty || { echo; die "no answer"; }; echo
+    read -r -s -p "  ${B}Again${N}: " p2 < /dev/tty || { echo; die "no answer"; }; echo
+    [[ -n "$p1" && "$p1" == "$p2" ]] && break
+    printf '    %s%s%s\n' "$R" "$([[ -z "$p1" ]] && echo "A passphrase is required for the admin key." || echo "They differ, try again.")" "$N"
+  done
+  make_key "$ADMIN_KEY" "$ADMIN@$NAME" "$p1"; unset p1 p2
+  ok "admin key $ADMIN_KEY (passphrase)"
+fi
+if [[ -z "$DEPLOY_KEY" ]]; then
+  DEPLOY_KEY="$SSH_DIR/${NAME}_deploy"
+  make_key "$DEPLOY_KEY" "deploy@$NAME" ""
+  ok "deploy key $DEPLOY_KEY (no passphrase)"
+fi
+ADMIN_PUB="$(cat "$(expand_tilde "$ADMIN_KEY").pub")"
+DEPLOY_PUB="$(cat "$(expand_tilde "$DEPLOY_KEY").pub")"
+
+section "ssh aliases"
+for entry in "$NAME:$ADMIN:$ADMIN_KEY" "${NAME}_deploy:deploy:$DEPLOY_KEY"; do
+  IFS=: read -r alias user keyfile <<<"$entry"
+  if grep -qE "^[[:space:]]*Host[[:space:]]+$alias([[:space:]]|$)" "$SSH_CONFIG"; then ok "ssh $alias (kept)"
+  else write_block "$alias" "$user" "${keyfile/#$HOME/\~}"; ok "ssh $alias  (user $user, port $PORT)"; fi
+done
+
+section "Upload"
+WORK="$(mktemp -d)"; trap 'rm -rf "$WORK"' EXIT
+CONF="serverbeef-$NAME.conf"
+cat > "$WORK/$CONF" <<EOF
+# Made by serverbeef-local.sh on $(hostname) for $NAME ($IP). Public keys only.
+ADMIN_USER=$ADMIN
+SSH_PORT=$PORT
+ADMIN_SSH_KEY="$ADMIN_PUB"
+DEPLOY_SSH_KEY="$DEPLOY_PUB"
+COPY_ROOT_KEYS=no
+EOF
+if [[ "$UPLOAD_VIA" == admin ]]; then
+  target="$NAME:"; run_cmd="ssh -t $NAME 'sudo bash serverbeef.sh --config $CONF'"
+  echo "    Uploading as $ADMIN through the existing alias (the server is already set up)."
+else
+  target="root@$IP:"; run_cmd="ssh -t root@$IP 'bash serverbeef.sh --config $CONF'"
+  echo "    Uploading as root. A fresh server asks for root's password from your provider (or uses the key you"
+  echo "    registered there). Type it once here; nothing is stored."
+fi
+if scp -o StrictHostKeyChecking=accept-new "$SERVERBEEF" "$WORK/$CONF" "$target"; then
+  ok "uploaded serverbeef.sh and $CONF"
+else
+  warn "upload failed. Fix the connection and run: scp $SERVERBEEF $WORK/$CONF $target"
+  cp "$WORK/$CONF" "$SCRIPT_DIR/$CONF"; warn "the config file is kept at $SCRIPT_DIR/$CONF (public keys only)"
+  trap - EXIT; rm -rf "$WORK"
+fi
+
+cat <<EOF
+
+${B}Done on this computer.${N}
+
+  Admin key  (you, passphrase):   $ADMIN_KEY
+    $ADMIN_PUB
+  Deploy key (CI and agents):     $DEPLOY_KEY
+    $DEPLOY_PUB
+
+${B}Next, on the server:${N}
+
+    $run_cmd
+
+  It shows your answers ($ADMIN, port $PORT, both keys) as defaults and asks about the rest. Keep that window open
+  and, when it is done, test from a second terminal:  ssh $NAME   and   sudo -v
+  Deployments then use:  ssh ${NAME}_deploy   (no sudo, no password)
+EOF
+
+if (( ${#SET_ASIDE[@]} > 0 )); then
+  echo
+  for f in "${SET_ASIDE[@]}"; do echo "    $f"; done
+  ask_yn CLEAN "Delete these old key files? They are not referenced by ~/.ssh/config." no
+  if [[ "$CLEAN" == yes ]]; then
+    for f in "${SET_ASIDE[@]}"; do rm -f -- "$f" "${f/.replaced-/.pub.replaced-}"; done; ok "deleted"
+  else echo "    kept; delete them yourself when you are sure."; fi
+fi

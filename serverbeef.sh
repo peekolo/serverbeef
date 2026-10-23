@@ -45,9 +45,9 @@ set -Eeuo pipefail
 # On the next run they become the defaults, unless overridden by env or flags.
 STATE_DIR="/etc/serverbeef"
 STATE_FILE="$STATE_DIR/state.conf"
-STATE_KEYS="ADMIN_USER ADMIN_SUDO_NOPASSWD SSH_PORT SSH_ALLOW_TCP_FORWARDING FIREWALL_TCP_PORTS FIREWALL_UDP_PORTS SWAP_SIZE AUTO_REBOOT AUTO_REBOOT_TIME INSTALL_DOCKER DOCKER_MODE DOCKER_USER"
+STATE_KEYS="ADMIN_USER ADMIN_SUDO_NOPASSWD SSH_PORT SSH_ALLOW_TCP_FORWARDING FIREWALL_TCP_PORTS FIREWALL_UDP_PORTS SWAP_SIZE AUTO_REBOOT AUTO_REBOOT_TIME INSTALL_DOCKER DOCKER_MODE DEPLOY_USER"
 SB_PREVIOUS=""        # "", "state" (saved settings) or "inferred" (older version, no state file)
-SB_PREV_DOCKER_USER="" # who ran rootless Docker before this run (from the state file)
+SB_PREV_DEPLOY_USER="" # the deploy user of the previous run (from the state file)
 SB_LAST_RUN=""
 
 set_if_unset() { [[ -z "${!1+x}" && -n "$2" ]] && printf -v "$1" '%s' "$2" || true; }
@@ -58,7 +58,8 @@ if [[ -r "$STATE_FILE" ]]; then
     [[ "$line" =~ ^([A-Z_]+)=\"([^\"]*)\"$ ]] || continue
     key="${BASH_REMATCH[1]}"; val="${BASH_REMATCH[2]}"
     if [[ "$key" == "SB_LAST_RUN" ]]; then SB_LAST_RUN="$val"
-    elif [[ "$key" == "DOCKER_USER" ]]; then SB_PREV_DOCKER_USER="$val"; [[ -n "${!key+x}" ]] || printf -v "$key" '%s' "$val"
+    elif [[ "$key" == "DEPLOY_USER" || "$key" == "DOCKER_USER" ]]; then   # DOCKER_USER: the name an older version saved
+      SB_PREV_DEPLOY_USER="$val"; [[ -n "${DEPLOY_USER+x}" ]] || DEPLOY_USER="$val"
     elif [[ " $STATE_KEYS " == *" $key "* && -z "${!key+x}" ]]; then printf -v "$key" '%s' "$val"   # empty is a real answer (e.g. no UDP ports)
     fi
   done < "$STATE_FILE"
@@ -90,8 +91,10 @@ fi
 
 # ----------------------------- Defaults --------------------------------------
 # Any of these can also be set as environment variables or in a --config file.
-ADMIN_USER="${ADMIN_USER:-deploy}"              # sudo user to create/configure
-ADMIN_SSH_KEY="${ADMIN_SSH_KEY:-}"              # public key(s), one per line
+ADMIN_USER="${ADMIN_USER:-}"                    # the human's sudo account. No default: you pick the name
+ADMIN_SSH_KEY="${ADMIN_SSH_KEY:-}"              # public key(s) for the admin, one per line
+DEPLOY_USER="${DEPLOY_USER:-deploy}"            # the deployment account: no password, no sudo, runs Docker
+DEPLOY_SSH_KEY="${DEPLOY_SSH_KEY:-}"            # public key(s) for the deploy user, one per line (CI, agents)
 ADMIN_PASSWORD="${ADMIN_PASSWORD:-}"            # sudo password (prefer the wizard over this)
 ADMIN_SUDO_NOPASSWD="${ADMIN_SUDO_NOPASSWD:-no}"  # no (sudo asks for a password) | yes | auto (yes if the user has an SSH key)
 GENERATE_PASSWORD="${GENERATE_PASSWORD:-no}"    # set by the wizard when you accept [auto-generate]
@@ -111,9 +114,7 @@ AUTO_REBOOT="${AUTO_REBOOT:-yes}"               # reboot automatically when secu
 AUTO_REBOOT_TIME="${AUTO_REBOOT_TIME:-04:00}"
 
 INSTALL_DOCKER="${INSTALL_DOCKER:-no}"          # yes | no
-DOCKER_MODE="${DOCKER_MODE:-rootless}"          # rootless (daemon runs as DOCKER_USER, never root) | rootful (classic root daemon)
-DOCKER_USER="${DOCKER_USER:-deploy}"            # who runs rootless Docker, created if missing. A separate user, so that
-                                                # deployments (CI, agents) never run as the admin
+DOCKER_MODE="${DOCKER_MODE:-rootless}"          # rootless (daemon runs as DEPLOY_USER, never root) | rootful (classic root daemon)
 ASSUME_YES="${ASSUME_YES:-no}"
 MODE=""                                         # "" (ask) | setup | verify
 
@@ -130,8 +131,10 @@ Without --yes, an interactive wizard asks for every setting below, using any
 flags you pass as its defaults.
 
 Options:
-  -u, --user NAME            Admin (sudo) user to create          [deploy]
+  -u, --user NAME            Admin (sudo) user: you              [required]
   -k, --ssh-key "KEY"        Public SSH key for the admin user (repeatable)
+      --deploy-user NAME     Deployment account: no sudo, no password, runs Docker [deploy]
+      --deploy-key "KEY"     Public SSH key for the deploy user (repeatable)
       --no-copy-root-keys    Don't copy root's authorized_keys to the admin user
       --sudo-nopasswd        Passwordless sudo: whoever holds the SSH key is root
       --sudo-password        sudo asks for a password (generated if none set) [default]
@@ -146,8 +149,7 @@ Options:
       --no-auto-reboot       Never reboot automatically
       --reboot-time HH:MM    Time for automatic reboots           [04:00]
       --docker               Install rootless Docker + Compose: the daemon
-                             runs as --docker-user, never as root
-      --docker-user NAME     User who runs Docker (created if missing) [deploy]
+                             runs as the deploy user, never as root
       --docker-rootful       Install the classic root Docker daemon instead
       --no-docker            Don't install Docker (default)
       --verify               Check an already set-up server (and offer fixes)
@@ -170,7 +172,7 @@ EOF
 # value; expansion, escapes, inline comments and shell statements are unsupported.
 load_config() {
   local file="$1" line name value line_no=0
-  local allowed=" $STATE_KEYS ADMIN_SSH_KEY ADMIN_PASSWORD GENERATE_PASSWORD COPY_ROOT_KEYS SET_HOSTNAME TIMEZONE ASSUME_YES "
+  local allowed=" $STATE_KEYS ADMIN_SSH_KEY DEPLOY_SSH_KEY ADMIN_PASSWORD GENERATE_PASSWORD COPY_ROOT_KEYS SET_HOSTNAME TIMEZONE ASSUME_YES "
   [[ -f "$file" && -r "$file" ]] || { echo "Cannot read config file" >&2; return 1; }
   while IFS= read -r line || [[ -n "$line" ]]; do
     line_no=$((line_no + 1))
@@ -196,6 +198,7 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     -u|--user)            need_arg "$@"; ADMIN_USER="$2"; shift 2 ;;
     -k|--ssh-key)         need_arg "$@"; ADMIN_SSH_KEY+="${ADMIN_SSH_KEY:+$'\n'}$2"; shift 2 ;;
+    --deploy-key)         need_arg "$@"; DEPLOY_SSH_KEY+="${DEPLOY_SSH_KEY:+$'\n'}$2"; shift 2 ;;
     --no-copy-root-keys)  COPY_ROOT_KEYS=no; shift ;;
     --sudo-nopasswd)      ADMIN_SUDO_NOPASSWD=yes; shift ;;
     --sudo-password)      ADMIN_SUDO_NOPASSWD=no; shift ;;
@@ -211,7 +214,7 @@ while [[ $# -gt 0 ]]; do
     --reboot-time)        need_arg "$@"; AUTO_REBOOT_TIME="$2"; shift 2 ;;
     --docker)             INSTALL_DOCKER=yes; DOCKER_MODE=rootless; shift ;;
     --docker-rootful)     INSTALL_DOCKER=yes; DOCKER_MODE=rootful; shift ;;
-    --docker-user)        need_arg "$@"; DOCKER_USER="$2"; shift 2 ;;
+    --deploy-user|--docker-user) need_arg "$@"; DEPLOY_USER="$2"; shift 2 ;;
     --no-docker)          INSTALL_DOCKER=no; shift ;;
     -c|--config)          need_arg "$@"
                           load_config "$2" || exit 1; shift 2 ;;
@@ -286,6 +289,8 @@ yesno() { case "${1,,}" in y|yes|true|1) echo yes ;; n|no|false|0) echo no ;; *)
 
 # ----------------------------- Validators ------------------------------------
 valid_user()       { [[ "$1" =~ ^[a-z_][a-z0-9_-]{0,31}$ && "$1" != "root" ]]; }
+valid_admin_user() { valid_user "$1" && [[ "$1" != "$DEPLOY_USER" ]]; }
+valid_deploy_user() { valid_user "$1" && [[ "$1" != "$ADMIN_USER" ]]; }
 valid_port()       { [[ "$1" =~ ^[1-9][0-9]{0,4}$ ]] && (( 10#$1 <= 65535 )); }
 valid_ports() {
   local p start end
@@ -314,7 +319,7 @@ valid_sshkey() {
 valid_password() { [[ "$1" != *$'\n'* && "$1" != *$'\r'* ]]; }
 
 # ----------------------------- Rootless Docker --------------------------------
-# The daemon runs as DOCKER_USER inside its own user namespace, so a container (or anyone
+# The daemon runs as DEPLOY_USER inside its own user namespace, so a container (or anyone
 # who can talk to the daemon) gets that user's rights and never root's. Nobody needs the
 # docker group. pasta keeps the visitor's source address on published ports, so a proxy or
 # fail2ban see real clients, and those ports are ordinary sockets that UFW filters.
@@ -367,14 +372,14 @@ as_user() {
     XDG_RUNTIME_DIR="/run/user/$uid" DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$uid/bus" \
     DOCKER_HOST="unix:///run/user/$uid/docker.sock" "$@"
 }
-as_docker_user() { as_user "$DOCKER_USER" "$@"; }
-# other_rootless_daemons: users other than DOCKER_USER that have this script's rootless Docker unit
+as_docker_user() { as_user "$DEPLOY_USER" "$@"; }
+# other_rootless_daemons: users other than DEPLOY_USER that have this script's rootless Docker unit
 other_rootless_daemons() {
   local unit user
   for unit in /home/*/.config/systemd/user/"${MARK}"-docker.service; do
     [[ -f "$unit" ]] || continue
     user="${unit#/home/}"; user="${user%%/*}"
-    [[ "$user" == "$DOCKER_USER" ]] || echo "$user"
+    [[ "$user" == "$DEPLOY_USER" ]] || echo "$user"
   done
 }
 # dockerctl ARGS...: the docker CLI against the daemon this server is configured for
@@ -587,28 +592,28 @@ verify_rootless_docker() {
   if grep -qw rootlesskit /sys/kernel/security/apparmor/profiles 2>/dev/null; then vpass "AppArmor allows rootlesskit to use user namespaces"
   else vwarn "AppArmor profile for rootlesskit is not loaded"; vhint "Fix: sudo apparmor_parser -r /etc/apparmor.d/rootlesskit"
   fi
-  if ! id "$DOCKER_USER" &>/dev/null; then
-    vfail "Docker user $DOCKER_USER does not exist"; vhint "Re-run setup with --docker --docker-user $DOCKER_USER"; return
+  if ! id "$DEPLOY_USER" &>/dev/null; then
+    vfail "Docker user $DEPLOY_USER does not exist"; vhint "Re-run setup with --docker"; return
   fi
-  if [[ "$DOCKER_USER" != "$ADMIN_USER" ]] && sudo -l -U "$DOCKER_USER" 2>/dev/null | grep -q '(ALL'; then
-    vwarn "$DOCKER_USER has sudo rights; a deploy user should have none"; vhint "Review sudo -l -U $DOCKER_USER"
+  if [[ "$DEPLOY_USER" != "$ADMIN_USER" ]] && sudo -l -U "$DEPLOY_USER" 2>/dev/null | grep -q '(ALL'; then
+    vwarn "$DEPLOY_USER has sudo rights; a deploy user should have none"; vhint "Review sudo -l -U $DEPLOY_USER"
   fi
   for other in $(other_rootless_daemons); do
-    vwarn "$other also has a rootless Docker daemon configured"; vhint "Fix: re-run setup with --docker-user $DOCKER_USER (it stops the other one), or: sudo -iu $other systemctl --user disable --now ${MARK}-docker"
+    vwarn "$other also has a rootless Docker daemon configured"; vhint "Fix: re-run setup with --docker --deploy-user $DEPLOY_USER (it stops the other one), or: sudo -iu $other systemctl --user disable --now ${MARK}-docker"
   done
-  uid="$(id -u "$DOCKER_USER")"
-  if [[ "$(loginctl show-user "$DOCKER_USER" -p Linger --value 2>/dev/null)" == yes ]]; then vpass "$DOCKER_USER's daemon starts at boot (linger)"
-  else vfail "$DOCKER_USER's daemon will not start at boot"; vhint "Fix: sudo loginctl enable-linger $DOCKER_USER"
+  uid="$(id -u "$DEPLOY_USER")"
+  if [[ "$(loginctl show-user "$DEPLOY_USER" -p Linger --value 2>/dev/null)" == yes ]]; then vpass "$DEPLOY_USER's daemon starts at boot (linger)"
+  else vfail "$DEPLOY_USER's daemon will not start at boot"; vhint "Fix: sudo loginctl enable-linger $DEPLOY_USER"
   fi
   if [[ -S "/run/user/$uid/docker.sock" ]] && as_docker_user docker info --format '{{.SecurityOptions}}' 2>/dev/null | grep -q rootless; then
-    vpass "Rootless Docker runs as $DOCKER_USER"
+    vpass "Rootless Docker runs as $DEPLOY_USER"
     environment="$(as_docker_user systemctl --user show -p Environment --value "${MARK}-docker.service" 2>/dev/null)"
     if [[ "$environment" == *DOCKERD_ROOTLESS_ROOTLESSKIT_NET=pasta* ]]; then vpass "Published ports keep the visitor's source address (pasta)"
     else vwarn "Rootless Docker is not using pasta: published ports show an internal source address"; vhint "Fix: re-run setup with --docker"
     fi
     verify_docker_bindings rootless
   else
-    vfail "Rootless Docker is not running for $DOCKER_USER"; vhint "Check: sudo -iu $DOCKER_USER systemctl --user status ${MARK}-docker"
+    vfail "Rootless Docker is not running for $DEPLOY_USER"; vhint "Check: sudo -iu $DEPLOY_USER systemctl --user status ${MARK}-docker"
   fi
 }
 verify_rootful_docker() {
@@ -682,12 +687,33 @@ run_verify() {
     vfail "User $ADMIN_USER does not exist"
   fi
 
+  section "Deploy account"
+  local deploy_home deploy_keys
+  if id "$DEPLOY_USER" &>/dev/null; then
+    vpass "User $DEPLOY_USER exists"
+    if id -nG "$DEPLOY_USER" | tr ' ' '\n' | grep -qxE 'sudo|admin' || sudo -l -U "$DEPLOY_USER" 2>/dev/null | grep -q '(ALL'; then
+      vfail "$DEPLOY_USER can reach root"; vhint "Fix: sudo gpasswd -d $DEPLOY_USER sudo, and check /etc/sudoers.d"
+    else vpass "$DEPLOY_USER has no sudo"
+    fi
+    if [[ "$(passwd -S "$DEPLOY_USER" 2>/dev/null | awk '{print $2}')" == P ]]; then
+      vwarn "$DEPLOY_USER has a password"; vhint "Fix: sudo passwd -d $DEPLOY_USER (it logs in with its key only)"
+    else vpass "$DEPLOY_USER has no password"
+    fi
+    deploy_home="$(getent passwd "$DEPLOY_USER" | cut -d: -f6)"
+    deploy_keys="$(count_keys "$deploy_home/.ssh/authorized_keys")"
+    if (( deploy_keys > 0 )); then vpass "$DEPLOY_USER has $deploy_keys SSH key(s)"
+    else vwarn "$DEPLOY_USER has no SSH key: nothing can log in as it"; vhint "Add one: re-run setup with --deploy-key"
+    fi
+  else
+    vfail "User $DEPLOY_USER does not exist"; vhint "Fix: run setup again"
+  fi
+
   section "Other accounts"
   # Provider images often leave a second sudo account behind (Vultr's "linuxuser", cloud images' "ubuntu").
   # Such an account with a password or sudo rights is a login path the owner may not know about.
   local other others=0 status
   while IFS=: read -r other _ uid _ _ _ shell; do
-    [[ "$other" == "$ADMIN_USER" || "$shell" == */nologin || "$shell" == */false ]] && continue
+    [[ "$other" == "$ADMIN_USER" || "$other" == "$DEPLOY_USER" || "$shell" == */nologin || "$shell" == */false ]] && continue
     (( uid >= 1000 || uid == 0 )) || continue
     status="$(passwd -S "$other" 2>/dev/null | awk '{print $2}')"
     if [[ "$status" == P ]]; then
@@ -905,9 +931,15 @@ ${C_BLUE}┌──────────────────────�
 └──────────────────────────────────────────────────────────┘${C_RESET}
   Every question has a default in [brackets] — just press Enter to accept it.
 EOF
+  cat <<EOF
+  serverbeef turns a fresh Ubuntu server into one you can leave on the internet: full update, firewall,
+  fail2ban, automatic security updates, key-only SSH on a port of its own, and two accounts. The admin is
+  you: it logs in with your key and becomes root with a password only you know. The deploy account is for
+  CI and AI agents: its own key, no password, no sudo, and it runs Docker without root. Safe to run again.
+EOF
 
   section "Admin user"
-  ask ADMIN_USER "Admin username" valid_user "The account you'll log in with (root login will be disabled)."
+  ask ADMIN_USER "Admin username" valid_admin_user "Required: the account you log in with (root login will be disabled). Your name works; '$DEPLOY_USER' is taken by the deployment account."
 
   section "SSH keys for $ADMIN_USER"
   existing_keys=0
@@ -958,6 +990,24 @@ EOF
   else
     WIZ_HAS_KEY=no
   fi
+
+  section "Deploy account"
+  echo "    A second account for deployments by CI or AI agents: its own key, no password, no sudo. It runs Docker."
+  ask DEPLOY_USER "Deployment account" valid_deploy_user
+  if id "$DEPLOY_USER" &>/dev/null; then
+    deploy_existing="$(count_keys "$(getent passwd "$DEPLOY_USER" | cut -d: -f6)/.ssh/authorized_keys")"
+    (( ${deploy_existing:-0} > 0 )) && echo "    $DEPLOY_USER already has $deploy_existing key(s) installed." || true
+  fi
+  [[ -n "$DEPLOY_SSH_KEY" ]] && echo "    $(grep -c . <<< "$DEPLOY_SSH_KEY") key(s) already given via --deploy-key." || true
+  echo "    ${C_DIM}Paste the public key your agents or CI will use (not your admin key), or Enter to skip.${C_RESET}"
+  while true; do
+    read -r -p "  ${C_BOLD}Public key for $DEPLOY_USER${C_RESET} [none]: " k < /dev/tty || k=""
+    [[ -z "$k" ]] && break
+    if ! valid_sshkey "$k"; then echo "    ${C_RED}Not a valid public key.${C_RESET}"; continue; fi
+    DEPLOY_SSH_KEY+="${DEPLOY_SSH_KEY:+$'\n'}$k"
+    echo "    ${C_GREEN}✔ added: $(key_fingerprint "$k")${C_RESET}"
+    another=no; ask_yn another "Add another key?"; [[ "$another" == "yes" ]] || break
+  done
 
   section "sudo"
   if [[ "$WIZ_HAS_KEY" == "yes" ]]; then
@@ -1011,10 +1061,7 @@ EOF
   ask_yn INSTALL_DOCKER "Install Docker + Docker Compose?"
   if [[ "$INSTALL_DOCKER" == "yes" ]]; then
     ask DOCKER_MODE "Docker mode (rootless/rootful)" valid_docker_mode "rootless: the daemon runs as a normal user and containers can never reach root. rootful: the classic root daemon; whoever may use it is root."
-    if [[ "$DOCKER_MODE" == "rootless" ]]; then
-      [[ -n "$DOCKER_USER" ]] || DOCKER_USER=deploy
-      ask DOCKER_USER "User who runs Docker" valid_user "Created if missing, no sudo. Keep it separate from $ADMIN_USER so that deployments (CI, agents) never run as the admin."
-    fi
+    [[ "$DOCKER_MODE" == "rootless" ]] && echo "    Rootless Docker will run as $DEPLOY_USER." || true
   fi
 fi
 
@@ -1029,8 +1076,8 @@ FIREWALL_TCP_PORTS="$(none_to_empty "$FIREWALL_TCP_PORTS")"
 FIREWALL_UDP_PORTS="$(none_to_empty "$FIREWALL_UDP_PORTS")"
 for v in COPY_ROOT_KEYS AUTO_REBOOT INSTALL_DOCKER; do printf -v "$v" '%s' "$(yesno "${!v}")"; done
 [[ "$ADMIN_SUDO_NOPASSWD" == "auto" ]] || ADMIN_SUDO_NOPASSWD="$(yesno "$ADMIN_SUDO_NOPASSWD")"
-[[ -n "$DOCKER_USER" ]] || DOCKER_USER=deploy
 
+[[ -n "$ADMIN_USER" ]] || die "No admin user. Pass --user NAME: the account you log in with ($DEPLOY_USER is the deployment account)"
 valid_user "$ADMIN_USER"                      || die "Invalid admin user: $ADMIN_USER"
 valid_port "$SSH_PORT"                        || die "Invalid SSH port: $SSH_PORT"
 valid_forwarding "$SSH_ALLOW_TCP_FORWARDING"  || die "Invalid forwarding mode: $SSH_ALLOW_TCP_FORWARDING"
@@ -1042,12 +1089,16 @@ valid_swap "$SWAP_SIZE"                       || die "Invalid swap size: $SWAP_S
 valid_time "$AUTO_REBOOT_TIME"                || die "Invalid reboot time: $AUTO_REBOOT_TIME"
 valid_password "$ADMIN_PASSWORD"              || die "Passwords must not contain line breaks"
 valid_docker_mode "$DOCKER_MODE"              || die "Invalid Docker mode: $DOCKER_MODE (rootless or rootful)"
-valid_user "$DOCKER_USER"                     || die "Invalid Docker user: $DOCKER_USER"
+valid_user "$DEPLOY_USER"                     || die "Invalid deploy user: $DEPLOY_USER"
+[[ "$ADMIN_USER" != "$DEPLOY_USER" ]]        || die "The admin and the deploy user must be different accounts (--user and --deploy-user)"
 [[ "$ADMIN_SUDO_NOPASSWD" =~ ^(yes|no|auto)$ ]] || die "Invalid ADMIN_SUDO_NOPASSWD: $ADMIN_SUDO_NOPASSWD"
 for v in COPY_ROOT_KEYS AUTO_REBOOT INSTALL_DOCKER; do valid_yesno "${!v}" || die "$v must be yes or no"; done
 while IFS= read -r k; do
   [[ -z "$k" ]] || valid_sshkey "$k" || die "Invalid SSH public key (value omitted)"
 done <<< "$ADMIN_SSH_KEY"
+while IFS= read -r k; do
+  [[ -z "$k" ]] || valid_sshkey "$k" || die "Invalid deploy SSH public key (value omitted)"
+done <<< "$DEPLOY_SSH_KEY"
 
 SWAP_REQUESTED="$SWAP_SIZE"   # step 9 turns "auto" into a size; save what was asked for
 
@@ -1071,9 +1122,14 @@ else
   key_summary="none → password login stays ON"
   [[ "$ADMIN_SUDO_NOPASSWD" == "auto" ]] && ADMIN_SUDO_NOPASSWD=no || true
 fi
+deploy_new_keys=0; [[ -z "$DEPLOY_SSH_KEY" ]] || deploy_new_keys="$(grep -c . <<< "$DEPLOY_SSH_KEY")"
+deploy_old_keys=0
+if id "$DEPLOY_USER" &>/dev/null; then deploy_old_keys="$(count_keys "$(getent passwd "$DEPLOY_USER" | cut -d: -f6)/.ssh/authorized_keys")"; fi
+if (( deploy_new_keys + deploy_old_keys > 0 )); then deploy_key_summary="$deploy_new_keys new, $deploy_old_keys existing"
+else deploy_key_summary="${C_YELLOW}none: nothing can log in as $DEPLOY_USER until you add one${C_RESET}"; fi
 docker_summary="$INSTALL_DOCKER"
 if [[ "$INSTALL_DOCKER" == yes ]]; then
-  [[ "$DOCKER_MODE" == rootless ]] && docker_summary+=" (rootless, run by $DOCKER_USER)" || docker_summary+=" (rootful: a root daemon)"
+  [[ "$DOCKER_MODE" == rootless ]] && docker_summary+=" (rootless, run by $DEPLOY_USER)" || docker_summary+=" (rootful: a root daemon)"
 fi
 cat <<EOF
 
@@ -1081,6 +1137,7 @@ ${C_BLUE}serverbeef — about to configure this server:${C_RESET}
   Admin user ............ $ADMIN_USER
   SSH keys .............. $key_summary
   Passwordless sudo ..... $ADMIN_SUDO_NOPASSWD$([[ "$GENERATE_PASSWORD" == yes ]] && echo " (password: auto-generated, delivered privately before the account update)")
+  Deploy user ........... $DEPLOY_USER (no sudo, no password; keys: $deploy_key_summary)
   SSH port .............. $SSH_PORT (forwarding: $SSH_ALLOW_TCP_FORWARDING)$([[ "$SSH_PORT_RANDOM" == yes ]] && echo " ${C_YELLOW}picked at random: write it down and open it in your provider's firewall${C_RESET}")
   Public TCP ports ...... ${FIREWALL_TCP_PORTS:-none}
   Public UDP ports ...... ${FIREWALL_UDP_PORTS:-none}
@@ -1159,25 +1216,29 @@ else
 fi
 ADMIN_HOME="$(getent passwd "$ADMIN_USER" | cut -d: -f6)"
 AUTH_KEYS="$ADMIN_HOME/.ssh/authorized_keys"
-# The home directory is user-controlled. Perform writes as that user so a
-# symlink swap cannot make this root process overwrite or chown a system file.
-# shellcheck disable=SC2016 # This program is interpreted by the child shell.
-runuser -u "$ADMIN_USER" -- bash -c '
-  set -e
-  umask 077
-  [[ ! -L "$1/.ssh" && ! -L "$2" ]]
-  mkdir -p -- "$1/.ssh"
-  chmod 700 -- "$1/.ssh"
-  [[ ! -e "$2" || ( -f "$2" && $(stat -c %h -- "$2") == 1 ) ]]
-  touch -- "$2"
-  chmod 600 -- "$2"
-' serverbeef "$ADMIN_HOME" "$AUTH_KEYS"
+# prepare_authorized_keys USER HOME FILE: the home directory is user-controlled. Perform writes as that
+# user so a symlink swap cannot make this root process overwrite or chown a system file.
+prepare_authorized_keys() {
+  # shellcheck disable=SC2016 # This program is interpreted by the child shell.
+  runuser -u "$1" -- bash -c '
+    set -e
+    umask 077
+    [[ ! -L "$1/.ssh" && ! -L "$2" ]]
+    mkdir -p -- "$1/.ssh"
+    chmod 700 -- "$1/.ssh"
+    [[ ! -e "$2" || ( -f "$2" && $(stat -c %h -- "$2") == 1 ) ]]
+    touch -- "$2"
+    chmod 600 -- "$2"
+  ' serverbeef "$2" "$3"
+}
+prepare_authorized_keys "$ADMIN_USER" "$ADMIN_HOME" "$AUTH_KEYS"
 
+# add_key KEY [USER FILE]: append KEY to the user's authorized_keys once (defaults: the admin)
 add_key() {
-  local key="$1"
+  local key="$1" user="${2:-$ADMIN_USER}" file="${3:-$AUTH_KEYS}"
   [[ -z "$key" || "$key" =~ ^# ]] && return 0
   # shellcheck disable=SC2016 # This program is interpreted by the child shell.
-  printf '%s\n' "$key" | runuser -u "$ADMIN_USER" -- bash -c '
+  printf '%s\n' "$key" | runuser -u "$user" -- bash -c '
     set -e
     IFS= read -r key
     [[ -f "$1" && ! -L "$1" && $(stat -c %h -- "$1") == 1 ]]
@@ -1186,7 +1247,7 @@ add_key() {
       [[ ! -s "$1" || -z "$(tail -c 1 -- "$1")" ]] || printf "\n" >> "$1"
       printf "%s\n" "$key" >> "$1"
     fi
-  ' serverbeef "$AUTH_KEYS"
+  ' serverbeef "$file"
 }
 if [[ -n "$ADMIN_SSH_KEY" ]]; then
   while IFS= read -r k; do add_key "$k"; done <<< "$ADMIN_SSH_KEY"
@@ -1251,6 +1312,38 @@ else
   usermod -aG sudo "$ADMIN_USER"
   rm -f "$SUDOERS_FILE"
   ok "sudo requires $ADMIN_USER's password"
+fi
+
+# The deploy account: for CI and agents. Its own keys, no password, no sudo, never a privileged group.
+if id "$DEPLOY_USER" &>/dev/null; then
+  ok "Deploy user $DEPLOY_USER exists"
+else
+  adduser --disabled-password --gecos "" "$DEPLOY_USER" >/dev/null
+  ok "Deploy user $DEPLOY_USER created"
+fi
+getent group ssh-users >/dev/null || groupadd ssh-users
+usermod -aG ssh-users "$DEPLOY_USER"
+for g in sudo admin; do
+  if id -nG "$DEPLOY_USER" | tr ' ' '\n' | grep -qx "$g"; then gpasswd -d "$DEPLOY_USER" "$g" >/dev/null; ok "$DEPLOY_USER removed from the $g group"; fi
+done
+rm -f "/etc/sudoers.d/90-${MARK}-${DEPLOY_USER}"
+if grep -qsE "^[[:space:]]*${DEPLOY_USER}[[:space:]]" /etc/sudoers /etc/sudoers.d/*; then
+  warn "$DEPLOY_USER has a sudoers rule outside this script; remove it, the deploy account must not reach root"
+fi
+if passwd -S "$DEPLOY_USER" 2>/dev/null | awk '{print $2}' | grep -q '^P'; then
+  warn "$DEPLOY_USER has a password; the deploy account should have none: passwd -d $DEPLOY_USER"
+fi
+DEPLOY_HOME="$(getent passwd "$DEPLOY_USER" | cut -d: -f6)"
+DEPLOY_AUTH_KEYS="$DEPLOY_HOME/.ssh/authorized_keys"
+prepare_authorized_keys "$DEPLOY_USER" "$DEPLOY_HOME" "$DEPLOY_AUTH_KEYS"
+if [[ -n "$DEPLOY_SSH_KEY" ]]; then
+  while IFS= read -r k; do add_key "$k" "$DEPLOY_USER" "$DEPLOY_AUTH_KEYS"; done <<< "$DEPLOY_SSH_KEY"
+fi
+DEPLOY_KEY_COUNT="$(count_keys "$DEPLOY_AUTH_KEYS")"
+if (( DEPLOY_KEY_COUNT > 0 )); then
+  ok "$DEPLOY_KEY_COUNT SSH key(s) installed for $DEPLOY_USER (no sudo, no password)"
+else
+  warn "No SSH key for $DEPLOY_USER: nothing can log in as it yet. Add one with --deploy-key (keep it separate from your admin key)"
 fi
 
 # ============================================================================
@@ -1621,7 +1714,7 @@ ok "Core dumps off, su restricted, unused kernel modules blocked"
 step "11/11 Optional: Docker"
 # ============================================================================
 if [[ "$INSTALL_DOCKER" == "yes" && "$DOCKER_MODE" == "rootless" ]]; then
-  # Rootless: the daemon runs as DOCKER_USER in a user namespace. Nobody is in the docker
+  # Rootless: the daemon runs as DEPLOY_USER in a user namespace. Nobody is in the docker
   # group, so Docker never hands out root. Published ports are plain sockets: UFW applies.
   if systemctl is-active --quiet docker && [[ -n "$(docker ps -q 2>/dev/null)" ]]; then
     die "The root Docker daemon still runs containers. Stop them (their data stays in /var/lib/docker) and re-run, or keep that daemon with --docker-rootful."
@@ -1632,7 +1725,7 @@ if [[ "$INSTALL_DOCKER" == "yes" && "$DOCKER_MODE" == "rootless" ]]; then
   [[ -x "$ROOTLESS_SH" ]] || die "dockerd-rootless.sh not found: this Docker package has no rootless support"
   systemctl disable --now docker.service docker.socket >/dev/null 2>&1 || true
   systemctl mask docker.service docker.socket >/dev/null 2>&1 || true
-  for u in "$ADMIN_USER" "$DOCKER_USER"; do
+  for u in "$ADMIN_USER" "$DEPLOY_USER"; do
     if id -nG "$u" 2>/dev/null | tr ' ' '\n' | grep -qx docker; then gpasswd -d "$u" docker >/dev/null; fi
   done
   if [[ -n "$(docker_group_members)" ]]; then
@@ -1645,25 +1738,25 @@ EOF
   sysctl -q -p "/etc/sysctl.d/90-${MARK}-rootless-docker.conf"
   # The Docker user changed since the last run: the old user's daemon must not keep running next to the new one.
   for old in $(other_rootless_daemons); do
-    [[ "$old" == "$SB_PREV_DOCKER_USER" ]] || continue
+    [[ "$old" == "$SB_PREV_DEPLOY_USER" ]] || continue
     as_user "$old" systemctl --user disable --now "${MARK}-docker.service" >/dev/null 2>&1 || true
     rm -f "/home/$old/.config/systemd/user/${MARK}-docker.service"
     as_user "$old" systemctl --user daemon-reload >/dev/null 2>&1 || true
     loginctl disable-linger "$old" 2>/dev/null || true
-    warn "Rootless Docker for $old stopped and disabled: $DOCKER_USER runs it now. Its images and containers stay in /home/$old/.local/share/docker; remove that directory if you do not need them"
+    warn "Rootless Docker for $old stopped and disabled: $DEPLOY_USER runs it now. Its images and containers stay in /home/$old/.local/share/docker; remove that directory if you do not need them"
   done
-  if ! id "$DOCKER_USER" &>/dev/null; then
-    adduser --disabled-password --gecos "" "$DOCKER_USER" >/dev/null
-    ok "User $DOCKER_USER created: no password, no sudo. Add SSH keys to its authorized_keys to let it log in"
+  if ! id "$DEPLOY_USER" &>/dev/null; then
+    adduser --disabled-password --gecos "" "$DEPLOY_USER" >/dev/null
+    ok "User $DEPLOY_USER created: no password, no sudo. Add SSH keys to its authorized_keys to let it log in"
   fi
-  usermod -aG ssh-users "$DOCKER_USER"
-  grep -q "^$DOCKER_USER:" /etc/subuid || usermod --add-subuids "$(next_subid_range /etc/subuid)" "$DOCKER_USER"
-  grep -q "^$DOCKER_USER:" /etc/subgid || usermod --add-subgids "$(next_subid_range /etc/subgid)" "$DOCKER_USER"
-  loginctl enable-linger "$DOCKER_USER"
-  docker_uid="$(id -u "$DOCKER_USER")"
-  docker_home="$(getent passwd "$DOCKER_USER" | cut -d: -f6)"
+  usermod -aG ssh-users "$DEPLOY_USER"
+  grep -q "^$DEPLOY_USER:" /etc/subuid || usermod --add-subuids "$(next_subid_range /etc/subuid)" "$DEPLOY_USER"
+  grep -q "^$DEPLOY_USER:" /etc/subgid || usermod --add-subgids "$(next_subid_range /etc/subgid)" "$DEPLOY_USER"
+  loginctl enable-linger "$DEPLOY_USER"
+  docker_uid="$(id -u "$DEPLOY_USER")"
+  docker_home="$(getent passwd "$DEPLOY_USER" | cut -d: -f6)"
   for _ in $(seq 1 30); do [[ -S "/run/user/$docker_uid/bus" ]] && break; sleep 1; done
-  [[ -S "/run/user/$docker_uid/bus" ]] || die "The systemd user instance for $DOCKER_USER did not start. Check: loginctl user-status $DOCKER_USER"
+  [[ -S "/run/user/$docker_uid/bus" ]] || die "The systemd user instance for $DEPLOY_USER did not start. Check: loginctl user-status $DEPLOY_USER"
   as_docker_user install -d -m 700 "$docker_home/.config/docker" "$docker_home/.config/systemd/user"
   if [[ ! -f "$docker_home/.config/docker/daemon.json" ]]; then
     as_docker_user tee "$docker_home/.config/docker/daemon.json" >/dev/null <<'EOF'
@@ -1679,13 +1772,13 @@ EOF
   as_docker_user systemctl --user restart "${MARK}-docker.service"
   for _ in $(seq 1 30); do [[ -S "/run/user/$docker_uid/docker.sock" ]] && break; sleep 1; done
   if ! as_docker_user docker info --format '{{.SecurityOptions}}' 2>/dev/null | grep -q rootless; then
-    die "Rootless Docker did not start for $DOCKER_USER. Check: sudo -iu $DOCKER_USER systemctl --user status ${MARK}-docker"
+    die "Rootless Docker did not start for $DEPLOY_USER. Check: sudo -iu $DEPLOY_USER systemctl --user status ${MARK}-docker"
   fi
   as_docker_user docker context inspect rootless >/dev/null 2>&1 \
     || as_docker_user docker context create rootless --docker "host=unix:///run/user/$docker_uid/docker.sock" >/dev/null
   as_docker_user docker context use rootless >/dev/null
-  ok "Rootless Docker $(as_docker_user docker version --format '{{.Server.Version}}') runs as $DOCKER_USER; the root daemon is off and nobody is in the docker group"
-  [[ "$DOCKER_USER" == "$ADMIN_USER" ]] || ok "Use it as $DOCKER_USER: log in as that user, or sudo -iu $DOCKER_USER"
+  ok "Rootless Docker $(as_docker_user docker version --format '{{.Server.Version}}') runs as $DEPLOY_USER; the root daemon is off and nobody is in the docker group"
+  [[ "$DEPLOY_USER" == "$ADMIN_USER" ]] || ok "Use it as $DEPLOY_USER: log in as that user, or sudo -iu $DEPLOY_USER"
 elif [[ "$INSTALL_DOCKER" == "yes" ]]; then
   apt-get "${APT_OPTS[@]}" install docker.io docker-compose-v2 docker-buildx
   mkdir -p /etc/docker
@@ -1760,6 +1853,8 @@ cat <<EOF
      ssh -p $SSH_PORT $ADMIN_USER@$IP
      sudo -v
 
+ Deployments (CI, agents) log in as $DEPLOY_USER with its own key, no sudo: ssh -p $SSH_PORT $DEPLOY_USER@$IP
+
  Then, from that new session, verify everything (cleans up leftover
  firewall rules and runs a security audit):
 
@@ -1771,7 +1866,7 @@ cat <<EOF
      sudo unattended-upgrade --dry-run --debug
 
  Add a public port later:  sudo ufw allow 8080/tcp
-$([[ "$INSTALL_DOCKER" == yes && "$DOCKER_MODE" == rootless ]] && echo " Docker runs rootless as $DOCKER_USER: use it from that account (log in as $DOCKER_USER, or sudo -iu $DOCKER_USER).")
+$([[ "$INSTALL_DOCKER" == yes && "$DOCKER_MODE" == rootless ]] && echo " Docker runs rootless as $DEPLOY_USER: use it from that account (log in as $DEPLOY_USER, or sudo -iu $DEPLOY_USER).")
 EOF
 if (( ${#WARNINGS[@]} )); then
   echo

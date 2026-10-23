@@ -8,9 +8,9 @@ provider credentials and local configuration files out of the repository and its
 
 - Run only reviewed code as root. Downloading from a moving branch trusts every future change to that branch;
   for repeatable deployments, review and pin a full commit SHA and retain the reviewed file's checksum.
-- Protect the admin SSH key. Passwordless sudo is root. The `docker` group of a root daemon is root too, which
-  is why the default is rootless Docker run by a user of your choice; keep that deployment account separate
-  from the admin account and give it no sudo.
+- Protect the admin SSH key: it is the one that can become root, so give it a passphrase (`serverbeef-local.sh`
+  insists). The deploy account is the one agents and CI hold: its own key, no password, no sudo, and rootless
+  Docker, so nothing it does reaches root. Never copy the admin key to it.
 - A custom SSH port is discoverable. Authentication, patching and network policy provide protection.
 - Ports published by a root Docker daemon bypass UFW. Rootless Docker's published ports are ordinary sockets
   that UFW filters, but a container is only as isolated as user namespaces make it: a kernel bug in that
