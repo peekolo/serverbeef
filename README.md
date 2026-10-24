@@ -4,7 +4,9 @@ You built an app with AI and rented a server to put it online. A new server is e
 internet can try to guess a password if password login is enabled, and firewall and update policies vary by
 provider. serverbeef applies a baseline of host protections. You copy one command and answer a few questions,
 then test the new login and review the verification results. It does not audit your applications or guarantee
-that a server cannot be compromised. See [SECURITY.md](SECURITY.md) for the security boundaries.
+that a server cannot be compromised. See [SECURITY.md](SECURITY.md) for the security boundaries. Its companion
+project, [aideploy](https://github.com/peekolo/caddy-behind-cloudflare), puts your apps online on a server
+prepared this way, with your AI assistant doing the work.
 
 It works on a fresh **Ubuntu 26.04** server from any provider (DigitalOcean, Hetzner, Vultr, Linode and so on). It
 takes about ten minutes.
