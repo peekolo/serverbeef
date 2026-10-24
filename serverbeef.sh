@@ -170,6 +170,9 @@ EOF
 # ----------------------------- CLI args --------------------------------------
 # Config files are data, never shell programs. Quotes only delimit a literal
 # value; expansion, escapes, inline comments and shell statements are unsupported.
+CONFIG_SET=""   # settings that came from --config; the wizard shows them once and does not ask again
+CONFIG_FILE=""
+from_config() { [[ " $CONFIG_SET " == *" $1 "* ]]; }
 load_config() {
   local file="$1" line name value line_no=0
   local allowed=" $STATE_KEYS ADMIN_SSH_KEY DEPLOY_SSH_KEY ADMIN_PASSWORD GENERATE_PASSWORD COPY_ROOT_KEYS SET_HOSTNAME TIMEZONE ASSUME_YES "
@@ -191,6 +194,7 @@ load_config() {
       *[[:space:]\"\']*) echo "Quote config values containing spaces (line $line_no)" >&2; return 1 ;;
     esac
     printf -v "$name" '%s' "$value"
+    CONFIG_SET+=" $name"
   done < "$file"
 }
 need_arg() { [[ $# -ge 2 && -n "$2" ]] || { echo "Option $1 needs a value" >&2; exit 1; }; }
@@ -217,7 +221,7 @@ while [[ $# -gt 0 ]]; do
     --deploy-user|--docker-user) need_arg "$@"; DEPLOY_USER="$2"; shift 2 ;;
     --no-docker)          INSTALL_DOCKER=no; shift ;;
     -c|--config)          need_arg "$@"
-                          load_config "$2" || exit 1; shift 2 ;;
+                          load_config "$2" || exit 1; CONFIG_FILE="$2"; shift 2 ;;
     --verify)             MODE=verify; shift ;;
     --setup)              MODE=setup; shift ;;
     -y|--yes|--non-interactive) ASSUME_YES=yes; shift ;;
@@ -937,10 +941,23 @@ EOF
   you: it logs in with your key and becomes root with a password only you know. The deploy account is for
   CI and AI agents: its own key, no password, no sudo, and it runs Docker without root. Safe to run again.
 EOF
+  if [[ -n "$CONFIG_SET" ]]; then
+    echo; echo "  ${C_BOLD}Already answered by $CONFIG_FILE${C_RESET} (not asked again; the summary at the end shows everything):"
+    for key in $CONFIG_SET; do
+      case "$key" in
+        ADMIN_SSH_KEY|DEPLOY_SSH_KEY) echo "    $key: $(grep -c . <<< "${!key}") key(s)" ;;
+        ADMIN_PASSWORD) echo "    $key: (set)" ;;
+        *) echo "    $key=${!key}" ;;
+      esac
+    done
+  fi
 
   section "Admin user"
-  ask ADMIN_USER "Admin username" valid_admin_user "Required: the account you log in with (root login will be disabled). Your name works; '$DEPLOY_USER' is taken by the deployment account."
+  from_config ADMIN_USER || ask ADMIN_USER "Admin username" valid_admin_user "Required: the account you log in with (root login will be disabled). Your name works; '$DEPLOY_USER' is taken by the deployment account."
 
+  if from_config ADMIN_SSH_KEY && from_config COPY_ROOT_KEYS; then
+    WIZ_HAS_KEY=yes
+  else
   section "SSH keys for $ADMIN_USER"
   existing_keys=0
   if id "$ADMIN_USER" &>/dev/null; then
@@ -990,15 +1007,17 @@ EOF
   else
     WIZ_HAS_KEY=no
   fi
+  fi
 
   section "Deploy account"
   echo "    A second account for deployments by CI or AI agents: its own key, no password, no sudo. It runs Docker."
-  ask DEPLOY_USER "Deployment account" valid_deploy_user
+  from_config DEPLOY_USER || ask DEPLOY_USER "Deployment account" valid_deploy_user
   if id "$DEPLOY_USER" &>/dev/null; then
     deploy_existing="$(count_keys "$(getent passwd "$DEPLOY_USER" | cut -d: -f6)/.ssh/authorized_keys")"
     (( ${deploy_existing:-0} > 0 )) && echo "    $DEPLOY_USER already has $deploy_existing key(s) installed." || true
   fi
   [[ -n "$DEPLOY_SSH_KEY" ]] && echo "    $(grep -c . <<< "$DEPLOY_SSH_KEY") key(s) already given via --deploy-key." || true
+  if ! from_config DEPLOY_SSH_KEY; then
   echo "    ${C_DIM}Paste the public key your agents or CI will use (not your admin key), or Enter to skip.${C_RESET}"
   while true; do
     read -r -p "  ${C_BOLD}Public key for $DEPLOY_USER${C_RESET} [none]: " k < /dev/tty || k=""
@@ -1008,6 +1027,7 @@ EOF
     echo "    ${C_GREEN}✔ added: $(key_fingerprint "$k")${C_RESET}"
     another=no; ask_yn another "Add another key?"; [[ "$another" == "yes" ]] || break
   done
+  fi
 
   section "sudo"
   if [[ "$WIZ_HAS_KEY" == "yes" ]]; then
@@ -1037,7 +1057,7 @@ EOF
   fi
 
   section "SSH"
-  ask SSH_PORT "SSH port" valid_port "$([[ "$SSH_PORT_RANDOM" == yes ]] && echo "Picked at random for this server; keep it or type your own. " || true)Open it in your provider's firewall, if it has one, before you log in on it."
+  from_config SSH_PORT || ask SSH_PORT "SSH port" valid_port "$([[ "$SSH_PORT_RANDOM" == yes ]] && echo "Picked at random for this server; keep it or type your own. " || true)Open it in your provider's firewall, if it has one, before you log in on it."
   ask SSH_ALLOW_TCP_FORWARDING "TCP forwarding (no/local/yes)" valid_forwarding "'local' lets you tunnel to e.g. a database with ssh -L."
 
   section "Firewall"
@@ -1046,7 +1066,7 @@ EOF
 
   section "System"
   [[ -z "$SET_HOSTNAME" ]] && SET_HOSTNAME="$CURRENT_HOSTNAME" || true
-  ask SET_HOSTNAME "Hostname" valid_hostname "e.g. web01.example.com"
+  from_config SET_HOSTNAME || ask SET_HOSTNAME "Hostname" valid_hostname "e.g. web01.example.com"
   [[ -z "$TIMEZONE" ]] && TIMEZONE="$CURRENT_TZ" || true
   ask TIMEZONE "Timezone" valid_timezone "e.g. UTC, Europe/London, Asia/Singapore"
   ask SWAP_SIZE "Swap size (auto/none/2G)" valid_swap "auto = same as RAM, between 1G and 4G. Skipped if swap already exists."

@@ -23,7 +23,7 @@ def function(name):
 
 
 HELPERS = "".join(function(name) for name in (
-    "load_config", "valid_port", "valid_ports", "valid_sshkey",
+    "load_config", "from_config", "valid_port", "valid_ports", "valid_sshkey",
     "valid_password", "extract_key", "count_keys", "ssh_policy_ok",
     "restore_sshd_dropin", "add_key", "deliver_generated_password", "automatic_updates_enabled",
     "random_port", "rootless_docker_unit", "docker_group_members", "next_subid_range",
@@ -69,6 +69,14 @@ class SecurityTests(unittest.TestCase):
             ["bash", "-c", "set -euo pipefail\n" + HELPERS + program, "test", *args],
             env=variables, capture_output=True, text=True,
         )
+
+    def test_config_records_which_settings_it_set(self):
+        config = self.directory / "config"
+        config.write_text('ADMIN_USER=yang\nSSH_PORT=4821\nADMIN_SSH_KEY="ssh-ed25519 AAAA key"\n')
+        result = self.shell('CONFIG_SET=""; load_config "$1"; from_config ADMIN_USER && from_config SSH_PORT '
+                            '&& from_config ADMIN_SSH_KEY && ! from_config SET_HOSTNAME && echo "$CONFIG_SET"', str(config))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), "ADMIN_USER SSH_PORT ADMIN_SSH_KEY")
 
     def test_config_never_executes_substitution_or_backticks(self):
         marker = self.directory / "must-not-exist"

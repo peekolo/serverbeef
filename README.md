@@ -34,7 +34,8 @@ random SSH port it offers); and a passphrase. It shows what it is about to do an
   root; and the **deploy key** for your AI assistant or CI, with no passphrase, since that account can never reach
   root;
 - adds two entries to `~/.ssh/config`, so that later `ssh box1` is you and `ssh box1_deploy` is the deploy account;
-- uploads `serverbeef.sh` and a small file with your answers to the server as root. A fresh server asks for root's
+- uploads `serverbeef.sh` and a small file with your answers (admin name, port, the server name as its hostname,
+  both public keys) to the server with the login your provider gave you. A fresh server asks for root's
   password here (it is on your provider's dashboard), or uses the key you registered at the provider; type it once,
   nothing is stored.
 
@@ -50,7 +51,7 @@ ssh -t root@YOUR_SERVER_IP 'bash serverbeef.sh --config serverbeef-box1.conf'
 ```
 
 The first time, ssh asks whether you want to continue connecting: type `yes`. The script explains what it is about
-to do, then asks a few questions. Your admin name, port and both keys are already filled in from step 1; pressing
+to do, lists what step 1 already answered (admin name, port, hostname, both keys) and asks only the rest. Pressing
 Enter accepts the suggested answer shown in `[brackets]`, and that is fine for most of them. Two worth a thought:
 
 - sudo asks for a password: keep that. Type one you will remember or let it generate one, and save it in a

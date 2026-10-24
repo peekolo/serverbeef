@@ -238,7 +238,7 @@ for entry in "$NAME:$ADMIN" "${NAME}_deploy:deploy"; do
   if [[ "$MODE" != reset ]] && grep -qE "^[[:space:]]*Host[[:space:]]+$alias([[:space:]]|$)" "$SSH_CONFIG"; then echo "    keep   ssh $alias"
   else echo "    add    ssh $alias  (user $user, port $PORT)"; fi
 done
-echo "    upload serverbeef.sh and serverbeef-$NAME.conf (public keys only) to the server"
+echo "    upload serverbeef.sh and serverbeef-$NAME.conf to the server: admin name, port, hostname, both public keys"
 ask_yn GO "Go ahead?" yes
 [[ "$GO" == yes ]] || die "stopped; nothing changed"
 
@@ -276,7 +276,9 @@ CONF="serverbeef-$NAME.conf"
 cat > "$WORK/$CONF" <<EOF
 # Made by serverbeef-local.sh on $(hostname) for $NAME ($IP). Public keys only.
 ADMIN_USER=$ADMIN
+DEPLOY_USER=deploy
 SSH_PORT=$PORT
+$([[ "$NAME" =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?$ ]] && echo "SET_HOSTNAME=$NAME")
 ADMIN_SSH_KEY="$ADMIN_PUB"
 DEPLOY_SSH_KEY="$DEPLOY_PUB"
 COPY_ROOT_KEYS=no
@@ -314,7 +316,7 @@ ${B}Next, on the server:${N}
 
     $run_cmd
 
-  It shows your answers ($ADMIN, port $PORT, both keys) as defaults and asks about the rest. Keep that window open
+  It skips what is answered here ($ADMIN, port $PORT, hostname, both keys) and asks about the rest. Keep that window open
   and, when it is done, test from a second terminal:  ssh $NAME   and   sudo -v
   Deployments then use:  ssh ${NAME}_deploy   (no sudo, no password)
 EOF
