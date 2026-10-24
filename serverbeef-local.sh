@@ -178,9 +178,12 @@ echo "    The login your provider gave you, before serverbeef runs."
 # how the upload and the setup command reach the box
 NOW_USER='' NOW_PORT='' NOW_ALIAS=''
 if [[ -n "$admin_alias" ]]; then
-  NOW_ALIAS="$admin_alias"; ADMIN="$admin_user"; PORT="${admin_port:-22}"; ADMIN_KEY="$admin_idf"
-  ok "reached as $ADMIN through ssh $NOW_ALIAS (port $PORT, key $ADMIN_KEY): the server is already set up"
-else
+  ADMIN="$admin_user"; PORT="${admin_port:-22}"; ADMIN_KEY="$admin_idf"
+  ask_yn SETUP_DONE "Has serverbeef already run on it, so that ssh $admin_alias works (user $ADMIN, port $PORT)?" yes
+  if [[ "$SETUP_DONE" == yes ]]; then NOW_ALIAS="$admin_alias"; ok "reached as $ADMIN through ssh $NOW_ALIAS"
+  else echo "    Then the provider's login is used for the upload."; fi
+fi
+if [[ -z "$NOW_ALIAS" ]]; then
   ask NOW_USER "User you log in with today" root valid_login \
     "root on most providers. Some images use ubuntu, debian or admin instead; then sudo is used on the box."
   ask NOW_PORT "SSH port today" 22 valid_any_port
@@ -279,20 +282,20 @@ DEPLOY_SSH_KEY="$DEPLOY_PUB"
 COPY_ROOT_KEYS=no
 EOF
 if [[ -n "$NOW_ALIAS" ]]; then
-  scp_target=("$NOW_ALIAS:"); run_cmd="ssh -t $NOW_ALIAS 'sudo bash serverbeef.sh --config $CONF'"
+  scp_opts=(); target="$NOW_ALIAS:"; run_cmd="ssh -t $NOW_ALIAS 'sudo bash serverbeef.sh --config $CONF'"
   echo "    Uploading as $ADMIN through ssh $NOW_ALIAS."
 else
-  scp_target=(-P "$NOW_PORT" "$NOW_USER@$IP:")
+  scp_opts=(-P "$NOW_PORT"); target="$NOW_USER@$IP:"
   run_cmd="ssh -t -p $NOW_PORT $NOW_USER@$IP '$([[ "$NOW_USER" == root ]] || echo "sudo ")bash serverbeef.sh --config $CONF'"
   echo "    Uploading as $NOW_USER. A fresh server asks for $NOW_USER's password from your provider (or uses the key you"
   echo "    registered there). Type it once here; nothing is stored."
 fi
-if scp -o StrictHostKeyChecking=accept-new "$SERVERBEEF" "$WORK/$CONF" "${scp_target[@]}"; then
+if scp -o StrictHostKeyChecking=accept-new "${scp_opts[@]}" "$SERVERBEEF" "$WORK/$CONF" "$target"; then
   ok "uploaded serverbeef.sh and $CONF"
 else
   cp "$WORK/$CONF" "$SCRIPT_DIR/$CONF"
   warn "upload failed. The config file is kept at $SCRIPT_DIR/$CONF (public keys only). When the connection works, run:"
-  warn "  scp ${scp_target[*]:0:${#scp_target[@]}-1} $SERVERBEEF $SCRIPT_DIR/$CONF ${scp_target[*]: -1}"
+  warn "  scp ${scp_opts[*]} $SERVERBEEF $SCRIPT_DIR/$CONF $target"
   echo "    Permission denied: wrong password, or that user only takes a key registered at the provider (ssh -i <that key>)."
   echo "    Connection reset: too many attempts in a row; wait a minute."
   trap - EXIT; rm -rf "$WORK"
