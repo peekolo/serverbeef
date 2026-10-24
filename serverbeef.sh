@@ -45,7 +45,7 @@ set -Eeuo pipefail
 # On the next run they become the defaults, unless overridden by env or flags.
 STATE_DIR="/etc/serverbeef"
 STATE_FILE="$STATE_DIR/state.conf"
-STATE_KEYS="ADMIN_USER ADMIN_SUDO_NOPASSWD SSH_PORT SSH_ALLOW_TCP_FORWARDING FIREWALL_TCP_PORTS FIREWALL_UDP_PORTS SWAP_SIZE AUTO_REBOOT AUTO_REBOOT_TIME INSTALL_DOCKER DOCKER_MODE DEPLOY_USER"
+STATE_KEYS="ADMIN_USER ADMIN_SUDO_NOPASSWD SSH_PORT SSH_ALIAS SSH_ALLOW_TCP_FORWARDING FIREWALL_TCP_PORTS FIREWALL_UDP_PORTS SWAP_SIZE AUTO_REBOOT AUTO_REBOOT_TIME INSTALL_DOCKER DOCKER_MODE DEPLOY_USER"
 SB_PREVIOUS=""        # "", "state" (saved settings) or "inferred" (older version, no state file)
 SB_PREV_DEPLOY_USER="" # the deploy user of the previous run (from the state file)
 SB_LAST_RUN=""
@@ -102,6 +102,8 @@ COPY_ROOT_KEYS="${COPY_ROOT_KEYS:-yes}"         # copy root's authorized_keys to
 
 SSH_PORT="${SSH_PORT:-}"                        # empty or "random": a random free port in 1025-9999 (per server)
 SSH_ALLOW_TCP_FORWARDING="${SSH_ALLOW_TCP_FORWARDING:-local}" # no | local | yes  (local keeps `ssh -L` DB tunnels working)
+SSH_ALIAS="${SSH_ALIAS:-}"                      # this server's name in the owner's ~/.ssh/config (serverbeef-local.sh writes it);
+                                                # only used to print `ssh <alias>` instead of ssh -p PORT USER@IP
 
 FIREWALL_TCP_PORTS="${FIREWALL_TCP_PORTS-80 443}"   # extra public TCP ports (SSH is added automatically); empty = none
 FIREWALL_UDP_PORTS="${FIREWALL_UDP_PORTS-443}"      # 443/udp for HTTP/3 (QUIC); empty = none
@@ -140,6 +142,7 @@ Options:
       --sudo-password        sudo asks for a password (generated if none set) [default]
   -p, --ssh-port PORT        SSH port, or "random"                [random]
       --forwarding MODE      SSH TCP forwarding: no|local|yes     [local]
+      --ssh-alias NAME       This server's name in your ~/.ssh/config, for the commands printed at the end
       --tcp-ports "P ..."    Public TCP ports (besides SSH)       ["80 443"]
       --udp-ports "P ..."    Public UDP ports, "none" to disable  ["443"]
       --hostname NAME        Set hostname                         [current]
@@ -208,6 +211,7 @@ while [[ $# -gt 0 ]]; do
     --sudo-password)      ADMIN_SUDO_NOPASSWD=no; shift ;;
     -p|--ssh-port)        need_arg "$@"; SSH_PORT="$2"; shift 2 ;;
     --forwarding)         need_arg "$@"; SSH_ALLOW_TCP_FORWARDING="$2"; shift 2 ;;
+    --ssh-alias)          need_arg "$@"; SSH_ALIAS="$2"; shift 2 ;;
     --tcp-ports)          need_arg "$@"; FIREWALL_TCP_PORTS="$2"; shift 2 ;;
     --udp-ports)          need_arg "$@"; FIREWALL_UDP_PORTS="$2"; shift 2 ;;
     --hostname)           need_arg "$@"; SET_HOSTNAME="$2"; shift 2 ;;
@@ -306,6 +310,7 @@ valid_ports() {
     valid_port "$start" && valid_port "$end" && (( 10#$start < 10#$end )) || return 1
   done
 }
+valid_alias()      { [[ -z "$1" || "$1" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$ ]]; }
 valid_hostname()   { [[ -z "$1" || "$1" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]{0,251}[A-Za-z0-9])?$ ]]; }
 valid_timezone()   { [[ -z "$1" || ( "$1" != *..* && -f "/usr/share/zoneinfo/$1" ) ]]; }
 valid_swap()       { [[ "$1" =~ ^(auto|none|[0-9]+[MG])$ ]]; }
@@ -778,7 +783,7 @@ run_verify() {
     [[ "$INTERACTIVE" == "yes" ]] || { vhint "Remove with: sudo ${rule/#ufw /ufw delete }"; continue; }
     if [[ -n "$sport" && "$port" == "$sport" ]]; then
       vhint "Not removing: your current SSH session is connected through port $port."
-      vhint "Reconnect with: ssh -p $SSH_PORT $ADMIN_USER@<server>  — then run verify again."
+      vhint "Reconnect with: ${SSH_ALIAS:+ssh $SSH_ALIAS  (}ssh -p $SSH_PORT $ADMIN_USER@<server>${SSH_ALIAS:+)}  — then run verify again."
       continue
     fi
     answer=yes
@@ -1059,6 +1064,8 @@ EOF
   section "SSH"
   from_config SSH_PORT || ask SSH_PORT "SSH port" valid_port "$([[ "$SSH_PORT_RANDOM" == yes ]] && echo "Picked at random for this server; keep it or type your own. " || true)Open it in your provider's firewall, if it has one, before you log in on it."
   ask SSH_ALLOW_TCP_FORWARDING "TCP forwarding (no/local/yes)" valid_forwarding "'local' lets you tunnel to e.g. a database with ssh -L."
+  from_config SSH_ALIAS || ask SSH_ALIAS "This server's name in your ~/.ssh/config" valid_alias "Only for the commands printed at the end; type none if you have no entry for it."
+  SSH_ALIAS="$(none_to_empty "$SSH_ALIAS")"
 
   section "Firewall"
   ask FIREWALL_TCP_PORTS "Public TCP ports" valid_ports "Space-separated; SSH is added automatically."
@@ -1101,6 +1108,7 @@ for v in COPY_ROOT_KEYS AUTO_REBOOT INSTALL_DOCKER; do printf -v "$v" '%s' "$(ye
 valid_user "$ADMIN_USER"                      || die "Invalid admin user: $ADMIN_USER"
 valid_port "$SSH_PORT"                        || die "Invalid SSH port: $SSH_PORT"
 valid_forwarding "$SSH_ALLOW_TCP_FORWARDING"  || die "Invalid forwarding mode: $SSH_ALLOW_TCP_FORWARDING"
+valid_alias "$SSH_ALIAS"                      || die "Invalid ssh alias: $SSH_ALIAS"
 valid_ports "$FIREWALL_TCP_PORTS"             || die "Invalid TCP ports: $FIREWALL_TCP_PORTS"
 valid_ports "$FIREWALL_UDP_PORTS"             || die "Invalid UDP ports: $FIREWALL_UDP_PORTS"
 valid_hostname "$SET_HOSTNAME"                || die "Invalid hostname: $SET_HOSTNAME"
@@ -1865,15 +1873,15 @@ fi
 echo "${C_GREEN}=============================================================${C_RESET}"
 cat <<EOF
 
- SSH now listens on port ${C_BOLD}$SSH_PORT${C_RESET}. Write it down, allow it in your provider's firewall if it has one,
- and add it to your ~/.ssh/config.
+ SSH now listens on port ${C_BOLD}$SSH_PORT${C_RESET}. Allow it in your provider's firewall if it has one.
+$([[ -n "$SSH_ALIAS" ]] && echo " Your ~/.ssh/config knows this server as ${C_BOLD}$SSH_ALIAS${C_RESET} (and ${SSH_ALIAS}_deploy for the deploy account)." || echo " Write it down and add it to your ~/.ssh/config.")
 
  ${C_YELLOW}BEFORE closing this session${C_RESET}, open a NEW terminal and test:
 
-     ssh -p $SSH_PORT $ADMIN_USER@$IP
+     ${SSH_ALIAS:+ssh $SSH_ALIAS            ${C_DIM}(= }ssh -p $SSH_PORT $ADMIN_USER@$IP${SSH_ALIAS:+)${C_RESET}}
      sudo -v
 
- Deployments (CI, agents) log in as $DEPLOY_USER with its own key, no sudo: ssh -p $SSH_PORT $DEPLOY_USER@$IP
+ Deployments (CI, agents) log in as $DEPLOY_USER with its own key, no sudo: ${SSH_ALIAS:+ssh ${SSH_ALIAS}_deploy  (= }ssh -p $SSH_PORT $DEPLOY_USER@$IP${SSH_ALIAS:+)}
 
  Then, from that new session, verify everything (cleans up leftover
  firewall rules and runs a security audit):

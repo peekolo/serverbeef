@@ -159,6 +159,7 @@ saved in `/etc/serverbeef/state.conf` (never passwords or keys), and the script 
 | `--sudo-nopasswd` / `--sudo-password` | password | sudo asks for a password by default; `--sudo-nopasswd` makes the key holder root |
 | `-p, --ssh-port PORT` | `random` | SSH port; a random free port in 1025-9999 unless you give one |
 | `--forwarding no\|local\|yes` | `local` | SSH TCP forwarding |
+| `--ssh-alias NAME` | | This server's name in your `~/.ssh/config`; the commands printed at the end then read `ssh NAME`. The local script sets it |
 | `--tcp-ports "P ..."` | `"80 443"` | Public TCP ports besides SSH |
 | `--udp-ports "P ..."` | `"443"` | Public UDP ports (HTTP/3); `none` for none |
 | `--hostname NAME`, `--timezone TZ` | unchanged | |
